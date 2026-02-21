@@ -289,7 +289,7 @@ query_map = {
 
 
 def main(args):
-    model_name = "Qwen/Qwen2.5-Omni-7B"
+    model_name = args.model
 
     # Get paths from args
     video_path = getattr(args, "video_path", None)
@@ -430,6 +430,12 @@ def main(args):
 
 def parse_args():
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen2.5-Omni-7B",
+        help="Model name.",
+    )
     parser.add_argument(
         "--query-type",
         "-q",
