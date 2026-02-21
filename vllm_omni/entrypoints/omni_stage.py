@@ -13,6 +13,7 @@ import multiprocessing as mp
 import os
 import queue
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Sequence
@@ -291,6 +292,9 @@ class OmniStage:
         self._proc: mp.Process | None = None
         self._shm_threshold_bytes: int = 65536
         self._stage_init_timeout: int = stage_init_timeout
+        # Process monitoring thread
+        self._monitor_thread: threading.Thread | None = None
+        self._monitor_stop_event = threading.Event()
 
     def set_engine(self, engine: LLMEngine) -> None:
         """Set the LLM engine for this stage.
@@ -496,19 +500,95 @@ class OmniStage:
                         ),
                     )
                 self._proc.start()
+
+                # Start process health monitoring thread
+                self._monitor_stop_event.clear()
+                self._monitor_thread = threading.Thread(
+                    target=self._process_health_monitor,
+                    name=f"Stage-{self.stage_id}-ProcessMonitor",
+                    daemon=True,
+                )
+                self._monitor_thread.start()
+                logger.debug(f"[Stage-{self.stage_id}] Started process health monitoring thread")
         finally:
             if old_env is None:
                 os.environ.pop("VLLM_LOGGING_PREFIX", None)
             else:
                 os.environ["VLLM_LOGGING_PREFIX"] = old_env
 
-    def stop_stage_worker(self) -> None:
+    def check_process_health(self) -> tuple[bool, int | None]:
+        """Check if the stage worker process is still alive.
+
+        Returns:
+            Tuple of (is_alive, exitcode). If process doesn't exist or is Ray actor,
+            returns (True, None) to indicate no monitoring needed.
+        """
+        if hasattr(self, "_ray_actor") and self._ray_actor:
+            # Ray actors are managed differently, assume healthy
+            return (True, None)
+        elif self._proc is not None:
+            is_alive = self._proc.is_alive()
+            exitcode = self._proc.exitcode if not is_alive else None
+            return (is_alive, exitcode)
+        return (True, None)  # No process to monitor
+
+    def _process_health_monitor(self) -> None:
+        """Background thread that continuously monitors the stage worker process.
+
+        If the process crashes, it calls stop_stage_worker() to clean up.
+        """
+        check_interval = 1.0  # Check every second
+        while not self._monitor_stop_event.is_set():
+            # Wait for check interval or stop event
+            if self._monitor_stop_event.wait(timeout=check_interval):
+                # Stop event was set, exit the loop
+                break
+
+            # Check process health
+            is_alive, exitcode = self.check_process_health()
+            if not is_alive and exitcode is not None:
+                logger.error(
+                    f"[Stage-{self.stage_id}] Process health monitor detected process crash. "
+                    f"Exit code: {exitcode}. Calling stop_stage_worker() to clean up."
+                )
+                # Set stop event first to prevent deadlock
+                self._monitor_stop_event.set()
+                # Call stop_stage_worker to clean up (but skip monitor thread join)
+                try:
+                    self._stop_stage_worker_internal(skip_monitor_join=True)
+                except Exception as e:
+                    logger.error(
+                        f"[Stage-{self.stage_id}] Error during stop_stage_worker() cleanup: {e}",
+                        exc_info=True,
+                    )
+                # Exit the monitoring thread after detecting crash
+                break
+
+    def stop_stage_worker(self, skip_monitor_join: bool = False) -> None:
         """Stop the stage worker process gracefully.
 
         Sends shutdown signal to the worker and waits for it to terminate.
         If graceful shutdown fails, forcefully terminates the process.
         Handles both multiprocessing Process and Ray Actor.
+
+        Args:
+            skip_monitor_join: If True, skip joining the monitor thread (used when
+                called from the monitor thread itself to avoid deadlock).
         """
+        self._stop_stage_worker_internal(skip_monitor_join=skip_monitor_join)
+
+    def _stop_stage_worker_internal(self, skip_monitor_join: bool = False) -> None:
+        """Internal implementation of stop_stage_worker."""
+        # Stop the monitoring thread first (unless called from monitor thread)
+        if not skip_monitor_join:
+            if self._monitor_thread is not None and self._monitor_thread.is_alive():
+                self._monitor_stop_event.set()
+                try:
+                    self._monitor_thread.join(timeout=2)
+                except Exception as e:
+                    logger.debug(f"[Stage-{self.stage_id}] Failed to join monitor thread: {e}")
+                self._monitor_thread = None
+
         if self._in_q is not None:
             try:
                 self._in_q.put_nowait(SHUTDOWN_TASK)
