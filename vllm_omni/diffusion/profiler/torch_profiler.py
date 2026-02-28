@@ -23,6 +23,9 @@ def _get_profiler_activities() -> list[ProfilerActivity]:
     if device_type == "npu":
         # torch_npu adds ProfilerActivity.NPU
         activities.append(getattr(ProfilerActivity, "NPU"))
+    elif device_type == "xpu":
+        # Intel XPU support
+        activities.append(getattr(ProfilerActivity, "XPU"))
     else:
         activities.append(ProfilerActivity.CUDA)
     return activities
