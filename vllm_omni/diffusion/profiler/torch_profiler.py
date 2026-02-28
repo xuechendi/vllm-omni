@@ -21,11 +21,20 @@ def _get_profiler_activities() -> list[ProfilerActivity]:
     activities = [ProfilerActivity.CPU]
     device_type = current_omni_platform.device_type
     if device_type == "npu":
-        # torch_npu adds ProfilerActivity.NPU
-        activities.append(getattr(ProfilerActivity, "NPU"))
+        # torch_npu registers ProfilerActivity.NPU on import
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError:
+            pass
+        if hasattr(ProfilerActivity, "NPU"):
+            activities.append(ProfilerActivity.NPU)
+        else:
+            logger.warning("ProfilerActivity.NPU not available. Make sure torch_npu is installed.")
     elif device_type == "xpu":
-        # Intel XPU support
-        activities.append(getattr(ProfilerActivity, "XPU"))
+        if hasattr(ProfilerActivity, "XPU"):
+            activities.append(ProfilerActivity.XPU)
+        else:
+            logger.warning("ProfilerActivity.XPU not available. Make sure Intel XPU support is installed.")
     else:
         activities.append(ProfilerActivity.CUDA)
     return activities
