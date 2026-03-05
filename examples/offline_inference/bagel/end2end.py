@@ -140,7 +140,8 @@ def main():
             }
         )
 
-        omni = Omni(model=model_name, **omni_kwargs)
+        #omni = Omni(model=model_name, enable_layerwise_offload=True, **omni_kwargs)
+        omni = Omni(model=model_name, enable_layerwise_offload=True, **omni_kwargs)
 
         formatted_prompts = []
         for p in args.prompts:

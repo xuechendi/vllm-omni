@@ -3,7 +3,7 @@ stage_args:
   - stage_id: 0
     stage_type: llm
     runtime:
-      devices: "0"
+      devices: "7"
       max_batch_size: 1
     engine_args:
       model_stage: qwen3_tts
@@ -22,6 +22,7 @@ stage_args:
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 512
       max_model_len: 4096
+      max_cudagraph_capture_size: 0
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     # Use named connector to apply runtime.connectors.extra.
     output_connectors:
@@ -38,7 +39,7 @@ stage_args:
   - stage_id: 1
     stage_type: llm
     runtime:
-      devices: "0"
+      devices: "7"
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
