@@ -220,6 +220,8 @@ def resolve_model_config_path(model: str) -> str:
     default_config_path = current_omni_platform.get_default_stage_config_path()
     model_type_str = f"{model_type}.yaml"
     complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
+    logger.info(f"complete_config_path: {complete_config_path}")
+    return None
     if os.path.exists(complete_config_path):
         return str(complete_config_path)
 
