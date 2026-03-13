@@ -8,7 +8,7 @@ stage_args:
   - stage_id: 0
     stage_type: llm # Use llm stage type to launch OmniLLM
     runtime:
-      devices: "0,1,2,3"
+      devices: "0,1"
       max_batch_size: 1
     engine_args:
       model_stage: thinker
@@ -23,8 +23,9 @@ stage_args:
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
       hf_config_name: thinker_config
-      tensor_parallel_size: 4
+      tensor_parallel_size: 2
       max_cudagraph_capture_size: 0
+      quantization: fp8
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -40,7 +41,7 @@ stage_args:
   - stage_id: 1
     stage_type: llm # Use llm stage type to launch OmniLLM
     runtime:
-      devices: "4"
+      devices: "3"
       max_batch_size: 1
     engine_args:
       model_stage: talker
@@ -72,7 +73,7 @@ stage_args:
   - stage_id: 2
     stage_type: llm # Use llm stage type to launch OmniLLM
     runtime:
-      devices: "4"
+      devices: "3"
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
