@@ -610,6 +610,7 @@ class LongCatImageTransformer2DModel(nn.Module):
                     f"rank={sp_rank}, original_shape={original_shape}, chunked_shape={hidden_states.shape}"
                 )
         else:
+            fwd_context.sequence_parallel_size = 1
             fwd_context._sp_shard_depth = 0
             if not hasattr(self, "_sp_forward_logged"):
                 self._sp_forward_logged = True
