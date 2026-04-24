@@ -185,6 +185,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             else:
                 self.cache_backend.enable(self.pipeline)
 
+        # Apply platform-specific profiler hooks (e.g. synchronize barriers on XPU).
+        if self.od_config.profiler_config is not None:
+            n = current_omni_platform.apply_profiler_hooks(self.pipeline)
+            if n > 0:
+                logger.info("Profiler hooks applied to %d transformer blocks.", n)
+
         logger.info("Model runner: Initialization complete.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

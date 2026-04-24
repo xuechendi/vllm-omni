@@ -77,6 +77,18 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         return free
 
     @classmethod
+    def apply_profiler_hooks(cls, pipeline: torch.nn.Module) -> int:
+        """Insert synchronize barriers between transformer blocks for profiling.
+
+        XPU/SYCL dispatches kernels asynchronously, so without explicit sync
+        barriers the profiler trace shows overlapping regions that make
+        per-block attribution inaccurate.
+        """
+        from vllm_omni.diffusion.hooks.synchronize import apply_profiler_synchronize_hooks
+
+        return apply_profiler_synchronize_hooks(pipeline)
+
+    @classmethod
     def get_profiler_cls(cls) -> str:
         """Return XPU-specific profiler that handles XPU events."""
         return "vllm_omni.platforms.xpu.profiler.XPUTorchProfilerWrapper"

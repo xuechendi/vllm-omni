@@ -155,6 +155,22 @@ class OmniPlatform(Platform):
         os.environ.pop(cls.device_control_env_var, None)
 
     @classmethod
+    def apply_profiler_hooks(cls, pipeline: torch.nn.Module) -> int:
+        """Apply platform-specific profiler hooks to a pipeline.
+
+        Platforms with asynchronous dispatch (e.g. XPU/SYCL) can override
+        this to insert synchronize barriers between transformer blocks so
+        that profiler traces show accurate per-block timings.
+
+        Args:
+            pipeline: The diffusion pipeline model.
+
+        Returns:
+            Number of hooks applied.
+        """
+        return 0
+
+    @classmethod
     def get_profiler_cls(cls) -> str:
         """Get the profiler class for this platform.
 

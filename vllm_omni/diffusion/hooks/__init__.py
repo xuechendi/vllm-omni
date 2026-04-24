@@ -16,6 +16,11 @@ from vllm_omni.diffusion.hooks.sequence_parallel import (
     enable_sequence_parallel_for_model,
     remove_sequence_parallel,
 )
+from vllm_omni.diffusion.hooks.synchronize import (
+    SynchronizeHook,
+    apply_profiler_synchronize_hooks,
+    remove_profiler_synchronize_hooks,
+)
 
 __all__ = [
     # Base hooks
@@ -30,4 +35,8 @@ __all__ = [
     "remove_sequence_parallel",
     "enable_sequence_parallel_for_model",
     "disable_sequence_parallel_for_model",
+    # Profiler synchronize hooks
+    "SynchronizeHook",
+    "apply_profiler_synchronize_hooks",
+    "remove_profiler_synchronize_hooks",
 ]
