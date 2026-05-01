@@ -244,16 +244,15 @@ def main():
     profiler_enabled = bool(profile_dir)
     profiler_config = None
     if profiler_enabled:
-        from vllm.config import ProfilerConfig
-
-        profiler_config = ProfilerConfig(
-            profiler="torch",
-            torch_profiler_dir=profile_dir,
-            torch_profiler_record_shapes=args.profile_record_shapes,
-            torch_profiler_with_stack=args.profile_with_stack,
-            torch_profiler_with_memory=args.profile_with_memory,
-            torch_profiler_with_flops=args.profile_with_flops,
-        )
+        profiler_config = {
+            "profiler": "torch",
+            "torch_profiler_dir": profile_dir,
+            "torch_profiler_record_shapes": args.profile_record_shapes,
+            "torch_profiler_with_stack": args.profile_with_stack,
+            "torch_profiler_with_memory": args.profile_with_memory,
+            "active_iterations": args.num_inference_steps,
+            "warmup_iterations": 0,
+        }
 
     omni = Omni(
         model=args.model,

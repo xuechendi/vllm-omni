@@ -276,6 +276,21 @@ def main():
 
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+
+    # Configure profiler if enabled
+    profiler_config = None
+    if profiler_enabled:
+        profiler_dir = os.getenv("VLLM_TORCH_PROFILER_DIR")
+        profiler_config = {
+            "profiler": "torch",
+            "torch_profiler_dir": profiler_dir,
+            "torch_profiler_record_shapes": True,
+            "torch_profiler_with_memory": True,
+            "torch_profiler_with_stack": False,
+            "active_iterations": args.num_inference_steps,
+            "warmup_iterations": 0,
+        }
+
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
@@ -300,6 +315,7 @@ def main():
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        profiler_config=profiler_config,
     )
 
     if profiler_enabled:
