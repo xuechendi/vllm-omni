@@ -1349,7 +1349,9 @@ class Wan22S2VPipeline(
                 dim=2,
             )
             videos_last_frames = videos_last_frames.to(dtype=dtype, device=device)
-            motion_latents = self.prepare_motion_latents(videos_last_frames, device=device).to(dtype=dtype)
+            # Only prepare motion latents if there's another clip coming
+            if r < num_repeat - 1:
+                motion_latents = self.prepare_motion_latents(videos_last_frames, device=device).to(dtype=dtype)
 
             clips.append(clip_video.cpu())
 
