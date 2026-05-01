@@ -76,13 +76,14 @@ class SequentialOffloadHook(ModelHook):
         if param.device.type == "cpu":
             return
 
-        self._move_params(
-            module,
-            torch.device("cpu"),
-            non_blocking=not self.use_hsdp,
-            pin_memory=self.pin_memory,
-        )
-        current_omni_platform.empty_cache()
+        with torch.profiler.record_function(f"cpu_offload_to_cpu_{module.__class__.__name__}"):
+            self._move_params(
+                module,
+                torch.device("cpu"),
+                non_blocking=not self.use_hsdp,
+                pin_memory=self.pin_memory,
+            )
+            current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
         try:
@@ -91,7 +92,8 @@ class SequentialOffloadHook(ModelHook):
         except StopIteration:
             return
 
-        self._move_params(module, self.device, non_blocking=False)
+        with torch.profiler.record_function(f"cpu_offload_to_gpu_{module.__class__.__name__}"):
+            self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # Offload target modules to CPU
