@@ -847,7 +847,8 @@ class Wan22S2VPipeline(
         ref_pixel_values = tensor_trans(image)  # [C, H, W]
         ref_pixel_values = ref_pixel_values.unsqueeze(1).unsqueeze(0) * 2 - 1.0  # [1, C, 1, H, W]
         ref_pixel_values = ref_pixel_values.to(dtype=self.vae.dtype, device=device)
-        ref_latents = retrieve_latents(self.vae.encode(ref_pixel_values), sample_mode="argmax")
+        with torch.profiler.record_function("stage_vae_encode"):
+            ref_latents = retrieve_latents(self.vae.encode(ref_pixel_values), sample_mode="argmax")
         return self._normalize_latents(ref_latents)
 
     def prepare_motion_latents(
@@ -866,7 +867,8 @@ class Wan22S2VPipeline(
         """
         device = device or self.device
         motion_pixels = motion_pixels.to(dtype=self.vae.dtype, device=device)
-        motion_latents = retrieve_latents(self.vae.encode(motion_pixels), sample_mode="argmax")
+        with torch.profiler.record_function("stage_vae_encode"):
+            motion_latents = retrieve_latents(self.vae.encode(motion_pixels), sample_mode="argmax")
         return self._normalize_latents(motion_latents)
 
     def prepare_latents(
@@ -938,6 +940,11 @@ class Wan22S2VPipeline(
         # the float32→bfloat16 casts happen automatically (matching the
         # original Wan2.2 inference path).
         param_dtype = next(current_model.parameters()).dtype
+
+        # Synchronize and clear cache before transformer forward to isolate timing
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+
         with torch.amp.autocast(self.device.type, dtype=param_dtype):
             result = current_model(**kwargs)
         # WanModel_S2V.forward returns a list of tensors
@@ -990,60 +997,61 @@ class Wan22S2VPipeline(
         do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
 
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
-                self._current_timestep = t
+            for step_idx, t in enumerate(timesteps):
+                with torch.profiler.record_function(f"diffusion_step_{step_idx}"):
+                    self._current_timestep = t
 
-                latent_model_input = [latents.to(device)]
-                timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)
+                    latent_model_input = [latents.to(device)]
+                    timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)
 
-                # -- Positive (conditional) prediction kwargs --
-                positive_kwargs = {
-                    "x": latent_model_input,
-                    "t": timestep,
-                    "context": prompt_embeds[0:1],
-                    "seq_len": max_seq_len,
-                    "cond_states": cond_latents,
-                    "motion_latents": input_motion_latents,
-                    "ref_latents": ref_latents,
-                    "motion_frames": motion_frames,
-                    "drop_motion_frames": drop_first_motion,
-                    "audio_emb": positive_audio_emb,
-                }
-
-                if do_true_cfg:
-                    negative_kwargs = {
+                    # -- Positive (conditional) prediction kwargs --
+                    positive_kwargs = {
                         "x": latent_model_input,
                         "t": timestep,
-                        "context": negative_prompt_embeds[0:1],
+                        "context": prompt_embeds[0:1],
                         "seq_len": max_seq_len,
                         "cond_states": cond_latents,
                         "motion_latents": input_motion_latents,
                         "ref_latents": ref_latents,
                         "motion_frames": motion_frames,
                         "drop_motion_frames": drop_first_motion,
-                        "audio_emb": negative_audio_emb,
+                        "audio_emb": positive_audio_emb,
                     }
-                else:
-                    negative_kwargs = None
 
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
+                    if do_true_cfg:
+                        negative_kwargs = {
+                            "x": latent_model_input,
+                            "t": timestep,
+                            "context": negative_prompt_embeds[0:1],
+                            "seq_len": max_seq_len,
+                            "cond_states": cond_latents,
+                            "motion_latents": input_motion_latents,
+                            "ref_latents": ref_latents,
+                            "motion_frames": motion_frames,
+                            "drop_motion_frames": drop_first_motion,
+                            "audio_emb": negative_audio_emb,
+                        }
+                    else:
+                        negative_kwargs = None
 
-                # Scheduler step
-                latents = self.scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latents.unsqueeze(0),
-                    return_dict=False,
-                    generator=clip_generator,
-                )[0].squeeze(0)
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
 
-                pbar.update()
+                    # Scheduler step
+                    latents = self.scheduler.step(
+                        noise_pred.unsqueeze(0),
+                        t,
+                        latents.unsqueeze(0),
+                        return_dict=False,
+                        generator=clip_generator,
+                    )[0].squeeze(0)
+
+                    pbar.update()
 
         self._current_timestep = None
         return latents
@@ -1142,24 +1150,26 @@ class Wan22S2VPipeline(
 
         # ---- 1. Text encoding ----
         if prompt_embeds is None:
-            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=self.do_classifier_free_guidance,
-                num_videos_per_prompt=1,
-                max_sequence_length=512,
-                device=device,
-                dtype=dtype,
-            )
+            with torch.profiler.record_function("stage_text_encoder"):
+                prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    do_classifier_free_guidance=self.do_classifier_free_guidance,
+                    num_videos_per_prompt=1,
+                    max_sequence_length=512,
+                    device=device,
+                    dtype=dtype,
+                )
         else:
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
 
         # ---- 2. Audio encoding ----
-        audio_emb, audio_num_repeat, target_video_frames = self.encode_audio(
-            audio_path, infer_frames=infer_frames, device=device, dtype=dtype
-        )
+        with torch.profiler.record_function("stage_audio_encoder"):
+            audio_emb, audio_num_repeat, target_video_frames = self.encode_audio(
+                audio_path, infer_frames=infer_frames, device=device, dtype=dtype
+            )
         if num_repeat is None or num_repeat > audio_num_repeat:
             num_repeat = audio_num_repeat
 
@@ -1268,24 +1278,25 @@ class Wan22S2VPipeline(
                 _audio_enc.to("cpu")
 
             # -- Denoising loop --
-            latents = self.diffuse(
-                latents=latents,
-                timesteps=timesteps,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                guidance_scale=guidance_scale,
-                clip_generator=clip_generator,
-                dtype=dtype,
-                device=device,
-                max_seq_len=max_seq_len,
-                cond_latents=cond_latents,
-                input_motion_latents=input_motion_latents,
-                ref_latents=ref_latents,
-                motion_frames=mf,
-                drop_first_motion=drop_first_motion and r == 0,
-                positive_audio_emb=positive_audio_emb,
-                negative_audio_emb=negative_audio_emb,
-            )
+            with torch.profiler.record_function("stage_diffusion"):
+                latents = self.diffuse(
+                    latents=latents,
+                    timesteps=timesteps,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    guidance_scale=guidance_scale,
+                    clip_generator=clip_generator,
+                    dtype=dtype,
+                    device=device,
+                    max_seq_len=max_seq_len,
+                    cond_latents=cond_latents,
+                    input_motion_latents=input_motion_latents,
+                    ref_latents=ref_latents,
+                    motion_frames=mf,
+                    drop_first_motion=drop_first_motion and r == 0,
+                    positive_audio_emb=positive_audio_emb,
+                    negative_audio_emb=negative_audio_emb,
+                )
 
             # ---- Decode this clip ----
             latents_for_decode = latents.unsqueeze(0)  # [1, C, T, H, W]
@@ -1296,7 +1307,8 @@ class Wan22S2VPipeline(
 
             decode_latents = self._denormalize_latents(decode_latents)
             decode_latents = decode_latents.to(self.vae.dtype)
-            clip_video = self.vae.decode(decode_latents, return_dict=False)[0]  # [1, C, T, H, W]
+            with torch.profiler.record_function("stage_vae_decode"):
+                clip_video = self.vae.decode(decode_latents, return_dict=False)[0]  # [1, C, T, H, W]
 
             # Handle VAE patch parallel: only rank 0 gets result, broadcast to all ranks
             # This is needed for S2V's autoregressive loop where all ranks need the decoded frames

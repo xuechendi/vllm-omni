@@ -320,7 +320,8 @@ class WanS2VSelfAttention(nn.Module):
 
         # Attention — rope_apply_s2v preserves input dtype (bf16), so
         # query/key/value are all bf16 here, matching FlashAttention requirements.
-        hidden_states = self.attn(query, key, value)
+        with torch.profiler.record_function(f"SelfAttn_SDPA qkv_shapes={list(query.shape)}"):
+            hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(x)
 
@@ -374,7 +375,8 @@ class WanS2VCrossAttention(nn.Module):
         k = self.norm_k(self.to_k(context)).view(b, -1, n, d)
         v = self.to_v(context).view(b, -1, n, d)
 
-        x = self.attn(q, k, v)
+        with torch.profiler.record_function(f"CrossAttn_SDPA qkv_shapes={list(q.shape)}_{list(k.shape)}"):
+            x = self.attn(q, k, v)
         x = x.flatten(2, 3)
         x = x.type_as(q)
 
@@ -390,11 +392,22 @@ class WanS2VTransformerBlock(nn.Module):
     modulation is applied to each segment.
     """
 
-    def __init__(self, dim, ffn_dim, num_heads, window_size=(-1, -1), qk_norm=True, cross_attn_norm=False, eps=1e-6):
+    def __init__(
+        self,
+        dim,
+        ffn_dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=False,
+        eps=1e-6,
+        layer_idx=None,
+    ):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
         self.num_heads = num_heads
+        self.layer_idx = layer_idx
 
         # Self-attention (TP-enabled)
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
@@ -427,14 +440,16 @@ class WanS2VTransformerBlock(nn.Module):
             parts.append(norm_x[:, seg_idx[i] : seg_idx[i + 1]] * (1 + e[1][:, i : i + 1]) + e[0][:, i : i + 1])
         norm_x = torch.cat(parts, dim=1)
 
-        y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs)
+        with torch.profiler.record_function(f"TransformerBlock_{self.layer_idx}_self_attn"):
+            y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs)
         y_parts = []
         for i in range(2):
             y_parts.append(y[:, seg_idx[i] : seg_idx[i + 1]] * e[2][:, i : i + 1])
         x = x + torch.cat(y_parts, dim=1)
 
         # Cross-attention
-        x = x + self.cross_attn(self.norm3(x).type_as(x), context, context_lens)
+        with torch.profiler.record_function(f"TransformerBlock_{self.layer_idx}_cross_attn"):
+            x = x + self.cross_attn(self.norm3(x).type_as(x), context, context_lens)
 
         # FFN with per-segment modulation
         norm2_x = self.norm2(x).type_as(x)
@@ -606,7 +621,8 @@ class AudioCrossAttention(nn.Module):
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
 
-        x = self.attn(q, k, v)
+        with torch.profiler.record_function(f"AudioCrossAttn_SDPA qkv_shapes={list(q.shape)}_{list(k.shape)}"):
+            x = self.attn(q, k, v)
         x = x.flatten(2, 3)
         x = self.o(x)
         return x
@@ -708,7 +724,8 @@ class SimpleSelfAttention(nn.Module):
         q = q.view(b, s, n, d)
         k = k.view(b, s, n, d)
 
-        x = self.attn(q, k, v)
+        with torch.profiler.record_function(f"MotionerSelfAttn_SDPA qkv_shapes={list(q.shape)}"):
+            x = self.attn(q, k, v)
         x = x.flatten(2, 3)
         x = self.o(x)
         return x
@@ -752,7 +769,8 @@ class SwinSelfAttention(SimpleSelfAttention):
         v = torch.cat([v[:1], v, v[-1:]])
         v = torch.cat([v[1:-1], v[2:], v[:-2], ref_v], dim=1)
 
-        out = self.attn(q, k, v)
+        with torch.profiler.record_function(f"SwinSelfAttn_SDPA qkv_shapes={list(q.shape)}_{list(k.shape)}"):
+            out = self.attn(q, k, v)
         out = torch.cat([out, ref_v[:1]], axis=0)
         out = rearrange(out, "(b t) (h w) n d -> b (t h w) n d", t=T, h=H, w=W)
         x = out.flatten(2, 3)
@@ -821,9 +839,10 @@ class CausalSelfAttention(SimpleSelfAttention):
         v = torch.cat([v, ref_v], dim=1)
 
         outs = []
-        for i in range(q.shape[0]):
-            out = self.attn(q[i : i + 1], k[i : i + 1], v[i : i + 1])
-            outs.append(out)
+        with torch.profiler.record_function(f"CausalSelfAttn_SDPA qkv_shapes={list(q.shape)}_{list(k.shape)}"):
+            for i in range(q.shape[0]):
+                out = self.attn(q[i : i + 1], k[i : i + 1], v[i : i + 1])
+                outs.append(out)
         out = torch.cat(outs, dim=0)
         out = torch.cat([out, ref_v[:1]], axis=0)
         out = rearrange(out, "(b t) (h w) n d -> b (t h w) n d", t=T, h=H, w=W)
@@ -1271,8 +1290,8 @@ class WanS2VTransformer3DModel(nn.Module):
         # Transformer blocks (TP-enabled)
         self.blocks = nn.ModuleList(
             [
-                WanS2VTransformerBlock(dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
-                for _ in range(num_layers)
+                WanS2VTransformerBlock(dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, layer_idx=i)
+                for i in range(num_layers)
             ]
         )
 

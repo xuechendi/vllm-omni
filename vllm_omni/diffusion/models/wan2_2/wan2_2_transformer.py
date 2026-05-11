@@ -118,9 +118,11 @@ class WanFeedForward(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.net_0(hidden_states)
+        with torch.profiler.record_function(f"FFN_upproject input_shape={list(hidden_states.shape)}"):
+            hidden_states = self.net_0(hidden_states)
         hidden_states = self.net_1(hidden_states)
-        hidden_states = self.net_2(hidden_states)
+        with torch.profiler.record_function(f"FFN_downproject input_shape={list(hidden_states.shape)}"):
+            hidden_states = self.net_2(hidden_states)
         return hidden_states
 
 
@@ -383,7 +385,8 @@ class WanSelfAttention(nn.Module):
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Fused QKV projection
-        qkv, _ = self.to_qkv(hidden_states)
+        with torch.profiler.record_function(f"SelfAttn_QKV_proj input_shape={list(hidden_states.shape)}"):
+            qkv, _ = self.to_qkv(hidden_states)
 
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
@@ -411,12 +414,14 @@ class WanSelfAttention(nn.Module):
             attn_metadata = AttentionMetadata(attn_mask=attn_mask)
 
         # Compute attention using unified attention layer
-        hidden_states = self.attn(query, key, value, attn_metadata)
+        with torch.profiler.record_function(f"SelfAttn_SDPA qkv_shapes={list(query.shape)}"):
+            hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
         # Output projection
-        hidden_states = self.to_out(hidden_states)
+        with torch.profiler.record_function(f"SelfAttn_out_proj input_shape={list(hidden_states.shape)}"):
+            hidden_states = self.to_out(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
         return hidden_states
@@ -545,12 +550,14 @@ class WanCrossAttention(nn.Module):
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
         # Query projection
-        query = self.to_q(hidden_states)
+        with torch.profiler.record_function(f"CrossAttn_Q_proj input_shape={list(hidden_states.shape)}"):
+            query = self.to_q(hidden_states)
         query = self.norm_q(query)
 
         # KV projection from encoder
-        key = self.to_k(encoder_hidden_states)
-        value = self.to_v(encoder_hidden_states)
+        with torch.profiler.record_function(f"CrossAttn_KV_proj encoder_shape={list(encoder_hidden_states.shape)}"):
+            key = self.to_k(encoder_hidden_states)
+            value = self.to_v(encoder_hidden_states)
         key = self.norm_k(key)
 
         # Reshape for multi-head attention
@@ -573,7 +580,8 @@ class WanCrossAttention(nn.Module):
             hidden_states_img = hidden_states_img.type_as(query)
 
         # Main cross-attention using unified attention layer
-        hidden_states = self.attn(query, key, value)
+        with torch.profiler.record_function(f"CrossAttn_SDPA qkv_shapes={list(query.shape)}_{list(key.shape)}"):
+            hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
@@ -582,7 +590,8 @@ class WanCrossAttention(nn.Module):
             hidden_states = hidden_states + hidden_states_img
 
         # Output projection
-        hidden_states = self.to_out(hidden_states)
+        with torch.profiler.record_function(f"CrossAttn_out_proj input_shape={list(hidden_states.shape)}"):
+            hidden_states = self.to_out(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
         return hidden_states
@@ -602,8 +611,10 @@ class WanTransformerBlock(nn.Module):
         eps: float = 1e-6,
         added_kv_proj_dim: int | None = None,
         cross_attn_norm: bool = False,
+        layer_idx: int | None = None,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
 
         head_dim = dim // num_heads
 
@@ -660,12 +671,14 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, rotary_emb, hidden_states_mask)
+        with torch.profiler.record_function(f"TransformerBlock_{self.layer_idx}_self_attn"):
+            attn_output = self.attn1(norm_hidden_states, rotary_emb, hidden_states_mask)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
-        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
+        with torch.profiler.record_function(f"TransformerBlock_{self.layer_idx}_cross_attn"):
+            attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
@@ -834,8 +847,10 @@ class WanTransformer3DModel(nn.Module):
         # 3. Transformer blocks
         self.blocks = nn.ModuleList(
             [
-                WanTransformerBlock(inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm)
-                for _ in range(num_layers)
+                WanTransformerBlock(
+                    inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm, layer_idx=i
+                )
+                for i in range(num_layers)
             ]
         )
 

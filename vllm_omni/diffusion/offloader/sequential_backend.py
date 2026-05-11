@@ -80,13 +80,14 @@ class SequentialOffloadHook(ModelHook):
         # so non-blocking copies can race with cache eviction. Use blocking
         # copies on XPU to avoid NULL pointer errors during DMA.
         non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
-        self._move_params(
-            module,
-            torch.device("cpu"),
-            non_blocking=non_blocking,
-            pin_memory=self.pin_memory,
-        )
-        current_omni_platform.empty_cache()
+        with torch.profiler.record_function(f"cpu_offload_to_cpu_{module.__class__.__name__}"):
+            self._move_params(
+                module,
+                torch.device("cpu"),
+                non_blocking=non_blocking,
+                pin_memory=self.pin_memory,
+            )
+            current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
         try:
@@ -95,7 +96,8 @@ class SequentialOffloadHook(ModelHook):
         except StopIteration:
             return
 
-        self._move_params(module, self.device, non_blocking=False)
+        with torch.profiler.record_function(f"cpu_offload_to_gpu_{module.__class__.__name__}"):
+            self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # Offload target modules to CPU

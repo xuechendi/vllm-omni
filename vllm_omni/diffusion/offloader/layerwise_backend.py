@@ -182,55 +182,57 @@ class LayerwiseOffloadHook(ModelHook):
         Pre-fetch target block in an asynchronous way with compute - memory copy overlap,
         with non_blocking set to True.
         """
-        self.copy_stream.wait_stream(current_omni_platform.current_stream())
+        with torch.profiler.record_function("cpu_offload_prefetch"):
+            self.copy_stream.wait_stream(current_omni_platform.current_stream())
 
-        layer_params = self.next_block_parameters
-        layer_bufs = self.next_block_buffers
+            layer_params = self.next_block_parameters
+            layer_bufs = self.next_block_buffers
 
-        evt = current_omni_platform.Event()
-        gpu_weights: dict[torch.dtype, torch.Tensor] = {}
+            evt = current_omni_platform.Event()
+            gpu_weights: dict[torch.dtype, torch.Tensor] = {}
 
-        with current_omni_platform.stream(self.copy_stream):
-            for dtype, cpu_weight in self.dtype_cpu_flattened_weights.items():
-                gpu_weight = torch.empty(cpu_weight.shape, dtype=dtype, device=self.device)
-                gpu_weight.copy_(cpu_weight, non_blocking=non_blocking)
-                gpu_weights[dtype] = gpu_weight
+            with current_omni_platform.stream(self.copy_stream):
+                for dtype, cpu_weight in self.dtype_cpu_flattened_weights.items():
+                    gpu_weight = torch.empty(cpu_weight.shape, dtype=dtype, device=self.device)
+                    gpu_weight.copy_(cpu_weight, non_blocking=non_blocking)
+                    gpu_weights[dtype] = gpu_weight
 
-            evt.record(self.copy_stream)
+                evt.record(self.copy_stream)
 
-        for dtype, ordered_metadata in self.dtype_metadata.items():
-            # ordered_metadata: list[dict[str, Any]]
-            gpu_weight = gpu_weights[dtype]
+            for dtype, ordered_metadata in self.dtype_metadata.items():
+                # ordered_metadata: list[dict[str, Any]]
+                gpu_weight = gpu_weights[dtype]
 
-            for metadata in ordered_metadata:
-                target_name = metadata["name"]
-                target_param_or_buf = (
-                    layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
-                )
+                for metadata in ordered_metadata:
+                    target_name = metadata["name"]
+                    target_param_or_buf = (
+                        layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
+                    )
 
-                LayerwiseOffloadHook._set_tensor_storage(
-                    target_param_or_buf,
-                    gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(metadata["shape"]),
-                )
+                    LayerwiseOffloadHook._set_tensor_storage(
+                        target_param_or_buf,
+                        gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(metadata["shape"]),
+                    )
 
-        self._prefetch_done = evt
+            self._prefetch_done = evt
 
     @torch.compiler.disable
     def offload_layer(self) -> None:
         """Free GPU memory for layer by replacing tensors with empty placeholders.
         This function does not actually offload weights from GPU back to CPU.
         """
-        evt = self._prefetch_done
-        if evt is not None:
-            current_omni_platform.current_stream().wait_event(evt)
+        with torch.profiler.record_function("cpu_offload_free"):
+            evt = self._prefetch_done
+            if evt is not None:
+                current_omni_platform.current_stream().wait_event(evt)
 
-        self._prefetch_done = None
+            self._prefetch_done = None
 
-        # free GPU residency
-        for _, param in self.block_parameters.items():
-            LayerwiseOffloadHook._set_tensor_storage(param, LayerwiseOffloadHook._make_offload_placeholder(param))
-        for _, buf in self.block_buffers.items():
-            LayerwiseOffloadHook._set_tensor_storage(buf, LayerwiseOffloadHook._make_offload_placeholder(buf))
+            # free GPU residency
+            for _, param in self.block_parameters.items():
+                LayerwiseOffloadHook._set_tensor_storage(param, LayerwiseOffloadHook._make_offload_placeholder(param))
+            for _, buf in self.block_buffers.items():
+                LayerwiseOffloadHook._set_tensor_storage(buf, LayerwiseOffloadHook._make_offload_placeholder(buf))
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         # if the previous hook was skipped and the weights are not on device,

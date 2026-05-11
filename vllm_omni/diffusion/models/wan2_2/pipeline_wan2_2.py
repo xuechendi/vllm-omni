@@ -404,84 +404,85 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         first_frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
-                self._current_timestep = t
+            for step_idx, t in enumerate(timesteps):
+                with torch.profiler.record_function(f"diffusion_step_{step_idx}"):
+                    self._current_timestep = t
 
-                # Select model based on timestep and boundary_ratio
-                # High noise stage (t >= boundary_timestep): use transformer
-                # Low noise stage (t < boundary_timestep): use transformer_2
-                if boundary_timestep is not None and t < boundary_timestep:
-                    # Low noise stage - always use guidance_high for this stage
-                    current_guidance_scale = guidance_high
-                    if self.transformer_2 is not None:
-                        current_model = self.transformer_2
-                    elif self.transformer is not None:
-                        # Fallback to transformer if transformer_2 not loaded
-                        current_model = self.transformer
+                    # Select model based on timestep and boundary_ratio
+                    # High noise stage (t >= boundary_timestep): use transformer
+                    # Low noise stage (t < boundary_timestep): use transformer_2
+                    if boundary_timestep is not None and t < boundary_timestep:
+                        # Low noise stage - always use guidance_high for this stage
+                        current_guidance_scale = guidance_high
+                        if self.transformer_2 is not None:
+                            current_model = self.transformer_2
+                        elif self.transformer is not None:
+                            # Fallback to transformer if transformer_2 not loaded
+                            current_model = self.transformer
+                        else:
+                            raise RuntimeError("No transformer available for low-noise stage")
                     else:
-                        raise RuntimeError("No transformer available for low-noise stage")
-                else:
-                    # High noise stage - always use guidance_low for this stage
-                    current_guidance_scale = guidance_low
-                    if self.transformer is not None:
-                        current_model = self.transformer
-                    elif self.transformer_2 is not None:
-                        # Fallback to transformer_2 if transformer not loaded
-                        current_model = self.transformer_2
+                        # High noise stage - always use guidance_low for this stage
+                        current_guidance_scale = guidance_low
+                        if self.transformer is not None:
+                            current_model = self.transformer
+                        elif self.transformer_2 is not None:
+                            # Fallback to transformer_2 if transformer not loaded
+                            current_model = self.transformer_2
+                        else:
+                            raise RuntimeError("No transformer available for high-noise stage")
+
+                    if self.expand_timesteps and latent_condition is not None:
+                        # I2V mode: blend condition with latents using mask
+                        latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
+                        latent_model_input = latent_model_input.to(dtype)
+
+                        # Expand timesteps per patch - use floor division to match patch embedding
+                        patch_size = self.transformer_config.patch_size
+                        patch_height = latents.shape[3] // patch_size[1]
+                        patch_width = latents.shape[4] // patch_size[2]
+
+                        # Create mask at patch resolution (same as hidden states sequence length)
+                        patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
+                        patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]  # Ensure correct dimensions
+                        temp_ts = (patch_mask[0][0] * t).flatten()
+                        timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
                     else:
-                        raise RuntimeError("No transformer available for high-noise stage")
+                        # T2V mode: standard forward
+                        latent_model_input = latents.to(dtype)
+                        timestep = t.expand(latents.shape[0])
 
-                if self.expand_timesteps and latent_condition is not None:
-                    # I2V mode: blend condition with latents using mask
-                    latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
-                    latent_model_input = latent_model_input.to(dtype)
-
-                    # Expand timesteps per patch - use floor division to match patch embedding
-                    patch_size = self.transformer_config.patch_size
-                    patch_height = latents.shape[3] // patch_size[1]
-                    patch_width = latents.shape[4] // patch_size[2]
-
-                    # Create mask at patch resolution (same as hidden states sequence length)
-                    patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
-                    patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]  # Ensure correct dimensions
-                    temp_ts = (patch_mask[0][0] * t).flatten()
-                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-                else:
-                    # T2V mode: standard forward
-                    latent_model_input = latents.to(dtype)
-                    timestep = t.expand(latents.shape[0])
-
-                do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                    "current_model": current_model,
-                }
-                if do_true_cfg:
-                    negative_kwargs = {
+                    do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+                    positive_kwargs = {
                         "hidden_states": latent_model_input,
                         "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds,
+                        "encoder_hidden_states": prompt_embeds,
                         "attention_kwargs": attention_kwargs,
                         "return_dict": False,
                         "current_model": current_model,
                     }
-                else:
-                    negative_kwargs = None
+                    if do_true_cfg:
+                        negative_kwargs = {
+                            "hidden_states": latent_model_input,
+                            "timestep": timestep,
+                            "encoder_hidden_states": negative_prompt_embeds,
+                            "attention_kwargs": attention_kwargs,
+                            "return_dict": False,
+                            "current_model": current_model,
+                        }
+                    else:
+                        negative_kwargs = None
 
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=current_guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=current_guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
 
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-                pbar.update()
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                    pbar.update()
 
         return latents
 
@@ -590,15 +591,16 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             _t_pipeline_start = time.perf_counter()
             _t_text_enc_start = _t_pipeline_start
         if prompt_embeds is None:
-            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
-                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
-                device=device,
-                dtype=dtype,
-            )
+            with torch.profiler.record_function("stage_text_encoder"):
+                prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
+                    num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+                    max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                    device=device,
+                    dtype=dtype,
+                )
         else:
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
             if negative_prompt_embeds is not None:
@@ -684,7 +686,8 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 
             image_tensor = image_tensor.unsqueeze(2)  # [B, C, 1, H, W]
             image_tensor = image_tensor.to(device=device, dtype=self.vae.dtype)
-            latent_condition = retrieve_latents(self.vae.encode(image_tensor), sample_mode="argmax")
+            with torch.profiler.record_function("stage_vae_encode"):
+                latent_condition = retrieve_latents(self.vae.encode(image_tensor), sample_mode="argmax")
             latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
 
             # Normalize condition latents
@@ -727,19 +730,20 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
-        latents = self.diffuse(
-            latents=latents,
-            timesteps=timesteps,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            guidance_low=guidance_low,
-            guidance_high=guidance_high,
-            boundary_timestep=boundary_timestep,
-            dtype=dtype,
-            attention_kwargs=attention_kwargs,
-            latent_condition=latent_condition,
-            first_frame_mask=first_frame_mask,
-        )
+        with torch.profiler.record_function("stage_diffusion"):
+            latents = self.diffuse(
+                latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                guidance_low=guidance_low,
+                guidance_high=guidance_high,
+                boundary_timestep=boundary_timestep,
+                dtype=dtype,
+                attention_kwargs=attention_kwargs,
+                latent_condition=latent_condition,
+                first_frame_mask=first_frame_mask,
+            )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
@@ -759,17 +763,18 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         if output_type == "latent":
             output = latents
         else:
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+            with torch.profiler.record_function("stage_vae_decode"):
+                latents = latents.to(self.vae.dtype)
+                latents_mean = (
+                    torch.tensor(self.vae.config.latents_mean)
+                    .view(1, self.vae.config.z_dim, 1, 1, 1)
+                    .to(latents.device, latents.dtype)
+                )
+                latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                    1, self.vae.config.z_dim, 1, 1, 1
+                ).to(latents.device, latents.dtype)
+                latents = latents / latents_std + latents_mean
+                output = self.vae.decode(latents, return_dict=False)[0]
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -810,6 +815,11 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         """
         if current_model is None:
             current_model = self.transformer
+
+        # Synchronize and clear cache before transformer forward to isolate timing
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+
         return current_model(**kwargs)[0]
 
     def encode_prompt(

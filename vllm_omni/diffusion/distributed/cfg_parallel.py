@@ -111,7 +111,12 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
                 # Each rank computes one branch
                 kwargs = positive_kwargs if cfg_rank == 0 else negative_kwargs
-                local_pred = _wrap(self.predict_noise(**kwargs))
+                branch_type = "positive" if cfg_rank == 0 else "negative"
+
+                import torch
+
+                with torch.profiler.record_function(f"CFG_branch_{branch_type}"):
+                    local_pred = _wrap(self.predict_noise(**kwargs))
 
                 if output_slice is not None:
                     local_pred = _slice_pred(local_pred, output_slice)
@@ -130,8 +135,12 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
             else:
                 # Sequential CFG: compute both positive and negative
-                positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
-                negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
+                import torch
+
+                with torch.profiler.record_function("CFG_branch_positive"):
+                    positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
+                with torch.profiler.record_function("CFG_branch_negative"):
+                    negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)

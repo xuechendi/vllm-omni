@@ -283,63 +283,64 @@ class Wan22I2VPipeline(
         first_frame_mask: torch.Tensor,
     ) -> torch.Tensor:
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
-                self._current_timestep = t
+            for step_idx, t in enumerate(timesteps):
+                with torch.profiler.record_function(f"diffusion_step_{step_idx}"):
+                    self._current_timestep = t
 
-                # Select model and guidance scale based on timestep
-                current_model = self.transformer
-                current_guidance_scale = guidance_low
-                if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
-                    current_model = self.transformer_2
-                    current_guidance_scale = guidance_high
+                    # Select model and guidance scale based on timestep
+                    current_model = self.transformer
+                    current_guidance_scale = guidance_low
+                    if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
+                        current_model = self.transformer_2
+                        current_guidance_scale = guidance_high
 
-                # Prepare latent input
-                if self.expand_timesteps:
-                    # TI2V-5B style: blend condition with latents using mask
-                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
-                    latent_model_input = latent_model_input.to(dtype)
+                    # Prepare latent input
+                    if self.expand_timesteps:
+                        # TI2V-5B style: blend condition with latents using mask
+                        latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
+                        latent_model_input = latent_model_input.to(dtype)
 
-                    # Expand timesteps for each patch
-                    temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
-                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-                else:
-                    # Wan2.1 style: concatenate condition with latents
-                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
-                    timestep = t.expand(latents.shape[0])
+                        # Expand timesteps for each patch
+                        temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
+                        timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                    else:
+                        # Wan2.1 style: concatenate condition with latents
+                        latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                        timestep = t.expand(latents.shape[0])
 
-                do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds,
-                    "encoder_hidden_states_image": image_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                    "current_model": current_model,
-                }
-                if do_true_cfg:
-                    negative_kwargs = {
+                    do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+                    positive_kwargs = {
                         "hidden_states": latent_model_input,
                         "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds,
+                        "encoder_hidden_states": prompt_embeds,
                         "encoder_hidden_states_image": image_embeds,
                         "attention_kwargs": attention_kwargs,
                         "return_dict": False,
                         "current_model": current_model,
                     }
-                else:
-                    negative_kwargs = None
+                    if do_true_cfg:
+                        negative_kwargs = {
+                            "hidden_states": latent_model_input,
+                            "timestep": timestep,
+                            "encoder_hidden_states": negative_prompt_embeds,
+                            "encoder_hidden_states_image": image_embeds,
+                            "attention_kwargs": attention_kwargs,
+                            "return_dict": False,
+                            "current_model": current_model,
+                        }
+                    else:
+                        negative_kwargs = None
 
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=current_guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=current_guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
 
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-                pbar.update()
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                    pbar.update()
 
         return latents
 
@@ -474,15 +475,16 @@ class Wan22I2VPipeline(
             _t_text_enc_start = _t_pipeline_start
 
         if prompt_embeds is None:
-            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
-                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
-                device=device,
-                dtype=dtype,
-            )
+            with torch.profiler.record_function("stage_text_encoder"):
+                prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
+                    num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+                    max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                    device=device,
+                    dtype=dtype,
+                )
         else:
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
             if negative_prompt_embeds is not None:
@@ -498,10 +500,11 @@ class Wan22I2VPipeline(
             _t_img_enc_start = time.perf_counter()
         if self.has_image_encoder and self.transformer.config.image_dim is not None:
             if image_embeds is None:
-                if last_image is None:
-                    image_embeds = self.encode_image(image, device)
-                else:
-                    image_embeds = self.encode_image([image, last_image], device)
+                with torch.profiler.record_function("stage_image_encoder"):
+                    if last_image is None:
+                        image_embeds = self.encode_image(image, device)
+                    else:
+                        image_embeds = self.encode_image([image, last_image], device)
             image_embeds = image_embeds.repeat(batch_size, 1, 1)
             image_embeds = image_embeds.to(dtype)
         else:
@@ -577,20 +580,21 @@ class Wan22I2VPipeline(
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
-        latents = self.diffuse(
-            latents=latents,
-            timesteps=timesteps,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            image_embeds=image_embeds,
-            guidance_low=guidance_low,
-            guidance_high=guidance_high,
-            boundary_timestep=boundary_timestep,
-            dtype=dtype,
-            attention_kwargs=attention_kwargs,
-            condition=condition,
-            first_frame_mask=first_frame_mask,
-        )
+        with torch.profiler.record_function("stage_diffusion"):
+            latents = self.diffuse(
+                latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                image_embeds=image_embeds,
+                guidance_low=guidance_low,
+                guidance_high=guidance_high,
+                boundary_timestep=boundary_timestep,
+                dtype=dtype,
+                attention_kwargs=attention_kwargs,
+                condition=condition,
+                first_frame_mask=first_frame_mask,
+            )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
@@ -612,17 +616,18 @@ class Wan22I2VPipeline(
         if output_type == "latent":
             output = latents
         else:
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+            with torch.profiler.record_function("stage_vae_decode"):
+                latents = latents.to(self.vae.dtype)
+                latents_mean = (
+                    torch.tensor(self.vae.config.latents_mean)
+                    .view(1, self.vae.config.z_dim, 1, 1, 1)
+                    .to(latents.device, latents.dtype)
+                )
+                latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                    1, self.vae.config.z_dim, 1, 1, 1
+                ).to(latents.device, latents.dtype)
+                latents = latents / latents_std + latents_mean
+                output = self.vae.decode(latents, return_dict=False)[0]
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -665,6 +670,11 @@ class Wan22I2VPipeline(
         """
         if current_model is None:
             current_model = self.transformer
+
+        # Synchronize and clear cache before transformer forward to isolate timing
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+
         return current_model(**kwargs)[0]
 
     def encode_prompt(
@@ -797,7 +807,8 @@ class Wan22I2VPipeline(
         video_condition = video_condition.to(device=device, dtype=self.vae.dtype)
 
         # Encode through VAE
-        latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
+        with torch.profiler.record_function("stage_vae_encode"):
+            latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
         latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
 
         # Normalize latents
