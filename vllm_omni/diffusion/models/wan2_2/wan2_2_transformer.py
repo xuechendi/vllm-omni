@@ -799,6 +799,20 @@ class WanTransformer3DModel(nn.Module):
     ):
         super().__init__()
 
+        # Allow reducing number of layers via environment variable for testing
+        import os
+
+        reduced_layers = os.getenv("WAN_REDUCED_LAYERS")
+        self.num_layers_total = num_layers
+        self.num_layers_active = int(reduced_layers) if reduced_layers else num_layers
+        if self.num_layers_active > num_layers:
+            raise ValueError(f"WAN_REDUCED_LAYERS={self.num_layers_active} cannot exceed total layers {num_layers}")
+        if self.num_layers_active < num_layers:
+            logger.info(
+                f"WanTransformer3DModel: Running with REDUCED layers: {self.num_layers_active}/{num_layers} "
+                f"({self.num_layers_active / num_layers * 100:.1f}%)"
+            )
+
         # Store config for compatibility
         self.config = type(
             "Config",
@@ -845,12 +859,13 @@ class WanTransformer3DModel(nn.Module):
         )
 
         # 3. Transformer blocks
+        # Only create blocks for active layers to save memory
         self.blocks = nn.ModuleList(
             [
                 WanTransformerBlock(
                     inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm, layer_idx=i
                 )
-                for i in range(num_layers)
+                for i in range(self.num_layers_active)
             ]
         )
 
@@ -1007,6 +1022,18 @@ class WanTransformer3DModel(nn.Module):
             name = weight_name_remapping.get(name, name)
             original_name = name
             lookup_name = name
+
+            # Skip loading weights for unused layers when using reduced layers
+            if "blocks." in name:
+                # Extract layer number from names like "blocks.5.attn1.to_q.weight"
+                try:
+                    layer_num = int(name.split("blocks.")[1].split(".")[0])
+                    if layer_num >= self.num_layers_active:
+                        # Skip this layer's weights
+                        loaded_params.add(original_name)
+                        continue
+                except (IndexError, ValueError):
+                    pass  # Not a blocks weight, continue normal loading
 
             # Handle QKV fusion
             for param_name, weight_name, shard_id in stacked_params_mapping:

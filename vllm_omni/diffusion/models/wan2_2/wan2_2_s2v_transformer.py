@@ -931,7 +931,21 @@ class MotionerTransformers(nn.Module):
         self.freq_dim = freq_dim
         self.out_dim = out_dim
         self.num_heads = num_heads
+
+        # Allow reducing number of layers via environment variable for testing
+        import os
+
+        reduced_layers = os.getenv("WAN_REDUCED_LAYERS")
         self.num_layers = num_layers
+        self.num_layers_active = int(reduced_layers) if reduced_layers else num_layers
+        if self.num_layers_active > num_layers:
+            raise ValueError(f"WAN_REDUCED_LAYERS={self.num_layers_active} cannot exceed total layers {num_layers}")
+        if self.num_layers_active < num_layers:
+            logger.info(
+                f"S2V Model: Running with REDUCED layers: {self.num_layers_active}/{num_layers} "
+                f"({self.num_layers_active / num_layers * 100:.1f}%)"
+            )
+
         self.window_size = window_size
 
         self.enable_tsm = enable_tsm
@@ -940,12 +954,13 @@ class MotionerTransformers(nn.Module):
         self.sample_c = patch_size[0]
 
         self.patch_embedding = nn.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        # Only create blocks for active layers to save memory
         self.blocks = nn.ModuleList(
             [
                 MotionerAttentionBlock(
                     dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, self_attn_block=self_attn_block
                 )
-                for _ in range(num_layers)
+                for _ in range(self.num_layers_active)
             ]
         )
 
@@ -1275,7 +1290,21 @@ class WanS2VTransformer3DModel(nn.Module):
         self.text_dim = text_dim
         self.out_dim = out_dim
         self.num_heads = num_heads
+
+        # Allow reducing number of layers via environment variable for testing
+        import os
+
+        reduced_layers = os.getenv("WAN_REDUCED_LAYERS")
         self.num_layers = num_layers
+        self.num_layers_active = int(reduced_layers) if reduced_layers else num_layers
+        if self.num_layers_active > num_layers:
+            raise ValueError(f"WAN_REDUCED_LAYERS={self.num_layers_active} cannot exceed total layers {num_layers}")
+        if self.num_layers_active < num_layers:
+            logger.info(
+                f"S2V Model: Running with REDUCED layers: {self.num_layers_active}/{num_layers} "
+                f"({self.num_layers_active / num_layers * 100:.1f}%)"
+            )
+
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
@@ -1288,10 +1317,11 @@ class WanS2VTransformer3DModel(nn.Module):
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
 
         # Transformer blocks (TP-enabled)
+        # Only create blocks for active layers to save memory
         self.blocks = nn.ModuleList(
             [
                 WanS2VTransformerBlock(dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, layer_idx=i)
-                for i in range(num_layers)
+                for i in range(self.num_layers_active)
             ]
         )
 
@@ -1792,6 +1822,18 @@ class WanS2VTransformer3DModel(nn.Module):
         for name, loaded_weight in weights:
             original_name = name
             is_main_block = name.startswith("blocks.")
+
+            # Skip loading weights for unused layers when using reduced layers
+            if is_main_block:
+                # Extract layer number from names like "blocks.5.self_attn.q.weight"
+                try:
+                    layer_num = int(name.split("blocks.")[1].split(".")[0])
+                    if layer_num >= self.num_layers_active:
+                        # Skip this layer's weights
+                        loaded_params.add(original_name)
+                        continue
+                except (IndexError, ValueError):
+                    pass  # Not a valid blocks weight, continue normal loading
 
             if is_main_block:
                 # Try QKV fusion for self-attention
