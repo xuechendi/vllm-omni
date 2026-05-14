@@ -929,21 +929,17 @@ class Wan22S2VPipeline(
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """Forward pass through the S2V transformer to predict noise.
 
-        The S2V model returns a list of tensors (one per batch element).
-        We take the first element since S2V processes one sample at a time.
+        With return_dict=False, the model returns (output,) where output is [B, C, T, H, W].
+        We squeeze batch dim since S2V processes one sample at a time.
         """
         if current_model is None:
             current_model = self.transformer
-        # WanModel_S2V's norm layers compute in float32; autocast ensures
-        # the float32→bfloat16 casts happen automatically (matching the
-        # original Wan2.2 inference path).
         param_dtype = next(current_model.parameters()).dtype
         with torch.amp.autocast(self.device.type, dtype=param_dtype):
             result = current_model(**kwargs)
-        # WanModel_S2V.forward returns a list of tensors
-        if isinstance(result, list):
-            return result[0]
-        return result[0] if isinstance(result, tuple) else result
+        if isinstance(result, tuple):
+            return result[0].squeeze(0)
+        return result.sample.squeeze(0)
 
     def diffuse(
         self,
@@ -988,40 +984,42 @@ class Wan22S2VPipeline(
             Denoised latents [C, T, H, W]
         """
         do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
+        attention_kwargs = {}
+        current_model = self.transformer
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for t in timesteps:
                 self._current_timestep = t
 
-                latent_model_input = [latents.to(device)]
+                latent_model_input = latents.to(device).unsqueeze(0)
                 timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)
 
-                # -- Positive (conditional) prediction kwargs --
                 positive_kwargs = {
-                    "x": latent_model_input,
-                    "t": timestep,
-                    "context": prompt_embeds[0:1],
-                    "seq_len": max_seq_len,
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": prompt_embeds[0:1],
+                    "encoder_hidden_states_audio": positive_audio_emb,
                     "cond_states": cond_latents,
                     "motion_latents": input_motion_latents,
                     "ref_latents": ref_latents,
-                    "motion_frames": motion_frames,
                     "drop_motion_frames": drop_first_motion,
-                    "audio_emb": positive_audio_emb,
+                    "attention_kwargs": attention_kwargs,
+                    "return_dict": False,
+                    "current_model": current_model,
                 }
-
                 if do_true_cfg:
                     negative_kwargs = {
-                        "x": latent_model_input,
-                        "t": timestep,
-                        "context": negative_prompt_embeds[0:1],
-                        "seq_len": max_seq_len,
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds[0:1],
+                        "encoder_hidden_states_audio": negative_audio_emb,
                         "cond_states": cond_latents,
                         "motion_latents": input_motion_latents,
                         "ref_latents": ref_latents,
-                        "motion_frames": motion_frames,
                         "drop_motion_frames": drop_first_motion,
-                        "audio_emb": negative_audio_emb,
+                        "attention_kwargs": attention_kwargs,
+                        "return_dict": False,
+                        "current_model": current_model,
                     }
                 else:
                     negative_kwargs = None
