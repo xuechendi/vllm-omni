@@ -250,5 +250,6 @@ Models listed in `_NO_CACHE_ACCELERATION` in `vllm_omni/diffusion/registry.py` d
 |-------|------|-------|
 | Standard DiT | `cache_dit_backend.py::enable_cache_for_dit` | Default enabler, automatic |
 | Wan2.2 | `cache_dit_backend.py::enable_cache_for_wan22` | Dual-transformer, auto-detects mode |
+| Wan2.2 S2V | `cache_dit_backend.py::enable_cache_for_wan_s2v` | Single-transformer, speech-to-video |
 | LongCat | `cache_dit_backend.py::enable_cache_for_longcat_image` | Multi-block-list |
 | BAGEL | `cache_dit_backend.py::enable_cache_for_bagel` | Complex omni model |

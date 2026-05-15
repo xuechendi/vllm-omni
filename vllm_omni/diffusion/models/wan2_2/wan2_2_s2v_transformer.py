@@ -29,6 +29,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid, RotaryEmbeddingWanS2V
 from vllm_omni.platforms import current_omni_platform
@@ -258,7 +259,7 @@ class WanS2VSelfAttention(nn.Module):
             causal=False,
         )
 
-    def forward(self, x, seq_lens, freqs):
+    def forward(self, x, freqs, attn_metadata: AttentionMetadata | None = None):
         b, s = x.shape[:2]
 
         # Fused QKV
@@ -283,7 +284,7 @@ class WanS2VSelfAttention(nn.Module):
         query = query.view(b, s, self.num_heads, self.head_dim)
         key = key.view(b, s, self.num_kv_heads, self.head_dim)
 
-        hidden_states = self.attn(query, key, value)
+        hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(x)
 
@@ -330,14 +331,14 @@ class WanS2VCrossAttention(nn.Module):
             skip_sequence_parallel=True,
         )
 
-    def forward(self, x, context, context_lens=None):
+    def forward(self, x, context, attn_metadata: AttentionMetadata | None = None):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         q = self.norm_q(self.to_q(x)).view(b, -1, n, d)
         k = self.norm_k(self.to_k(context)).view(b, -1, n, d)
         v = self.to_v(context).view(b, -1, n, d)
 
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, attn_metadata)
         x = x.flatten(2, 3)
         x = x.type_as(q)
 
@@ -374,47 +375,60 @@ class WanS2VTransformerBlock(nn.Module):
         # 6-way scale-shift modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(self, x, timestep_proj, seq_lens, freqs, encoder_hidden_states, context_lens):
-        seg_boundary = timestep_proj[1]
-        seg_idx = [0, min(max(0, seg_boundary), x.size(1)), x.size(1)]
-        timestep_proj = timestep_proj[0]
+    def forward(
+        self,
+        hidden_states,
+        temb,
+        rotary_emb,
+        encoder_hidden_states,
+        hidden_states_mask: torch.Tensor | None = None,
+    ):
+        seg_boundary = temb[1]
+        seg_idx = [0, min(max(0, seg_boundary), hidden_states.size(1)), hidden_states.size(1)]
+        temb = temb[0]
 
-        modulation = (self.modulation.unsqueeze(2).to(timestep_proj.dtype) + timestep_proj).chunk(6, dim=1)
+        modulation = (self.modulation.unsqueeze(2).to(temb.dtype) + temb).chunk(6, dim=1)
         modulation = [element.squeeze(1) for element in modulation]
 
+        # Create attention metadata for self-attention
+        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
+
         # Self-attention with per-segment modulation
-        norm_x = self.norm1(x).type_as(x)
+        norm_hidden_states = self.norm1(hidden_states).type_as(hidden_states)
         parts = []
         for i in range(2):
             parts.append(
-                norm_x[:, seg_idx[i] : seg_idx[i + 1]] * (1 + modulation[1][:, i : i + 1]) + modulation[0][:, i : i + 1]
+                norm_hidden_states[:, seg_idx[i] : seg_idx[i + 1]] * (1 + modulation[1][:, i : i + 1])
+                + modulation[0][:, i : i + 1]
             )
-        norm_x = torch.cat(parts, dim=1)
+        norm_hidden_states = torch.cat(parts, dim=1)
 
-        y = self.self_attn(norm_x, seq_lens, freqs)
-        y_parts = []
+        attn_output = self.self_attn(norm_hidden_states, rotary_emb, self_attn_metadata)
+        attn_output_parts = []
         for i in range(2):
-            y_parts.append(y[:, seg_idx[i] : seg_idx[i + 1]] * modulation[2][:, i : i + 1])
-        x = x + torch.cat(y_parts, dim=1)
+            attn_output_parts.append(attn_output[:, seg_idx[i] : seg_idx[i + 1]] * modulation[2][:, i : i + 1])
+        hidden_states = hidden_states + torch.cat(attn_output_parts, dim=1)
 
-        # Cross-attention
-        x = x + self.cross_attn(self.norm3(x).type_as(x), encoder_hidden_states, context_lens)
+        # Cross-attention (no mask needed for cross-attention in S2V)
+        hidden_states = hidden_states + self.cross_attn(
+            self.norm3(hidden_states).type_as(hidden_states), encoder_hidden_states, None
+        )
 
         # FFN with per-segment modulation
-        norm2_x = self.norm2(x).type_as(x)
+        norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
         parts = []
         for i in range(2):
             parts.append(
-                norm2_x[:, seg_idx[i] : seg_idx[i + 1]] * (1 + modulation[4][:, i : i + 1])
+                norm_hidden_states[:, seg_idx[i] : seg_idx[i + 1]] * (1 + modulation[4][:, i : i + 1])
                 + modulation[3][:, i : i + 1]
             )
-        norm2_x = torch.cat(parts, dim=1)
-        y = self.ffn(norm2_x)
-        y_parts = []
+        norm_hidden_states = torch.cat(parts, dim=1)
+        ffn_output = self.ffn(norm_hidden_states)
+        ffn_output_parts = []
         for i in range(2):
-            y_parts.append(y[:, seg_idx[i] : seg_idx[i + 1]] * modulation[5][:, i : i + 1])
-        x = x + torch.cat(y_parts, dim=1)
-        return x
+            ffn_output_parts.append(ffn_output[:, seg_idx[i] : seg_idx[i + 1]] * modulation[5][:, i : i + 1])
+        hidden_states = hidden_states + torch.cat(ffn_output_parts, dim=1)
+        return hidden_states
 
 
 class WanS2VOutputScaleShiftPrepare(nn.Module):
@@ -1366,16 +1380,14 @@ class WanS2VTransformer3DModel(nn.Module):
         post_patch_sizes = torch.tensor([list(hidden_states.shape[2:])], dtype=torch.long).repeat(batch_size, 1)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
         self.original_seq_len = hidden_states.shape[1]
-        seq_lens = torch.full((batch_size,), self.original_seq_len, dtype=torch.long)
 
         ref = self.patch_embedding(ref_latents).flatten(2).transpose(1, 2)
         hidden_states = torch.cat([hidden_states, ref], dim=1)
-        seq_lens = seq_lens + ref.shape[1]
 
         mask_input = torch.zeros(batch_size, hidden_states.shape[1], dtype=torch.long, device=hidden_states.device)
         mask_input[:, self.original_seq_len :] = 1
 
-        return hidden_states, seq_lens, mask_input, post_patch_sizes
+        return hidden_states, mask_input, post_patch_sizes
 
     # ------------------------------------------------------------------
     # RoPE preparation
@@ -1488,7 +1500,6 @@ class WanS2VTransformer3DModel(nn.Module):
     def inject_motion(
         self,
         hidden_states,
-        seq_lens,
         rotary_emb,
         mask_input,
         motion_latents,
@@ -1509,13 +1520,12 @@ class WanS2VTransformer3DModel(nn.Module):
         if mot is not None and mot.shape[1] > 0:
             motion_len = mot.shape[1]
             hidden_states = torch.cat([hidden_states, mot], dim=1)
-            seq_lens = seq_lens + motion_len
             rotary_emb = torch.cat([rotary_emb, mot_remb], dim=1)
             motion_mask = 2 * torch.ones(
                 mask_input.shape[0], motion_len, device=mask_input.device, dtype=mask_input.dtype
             )
             mask_input = torch.cat([mask_input, motion_mask], dim=1)
-        return hidden_states, seq_lens, rotary_emb, mask_input
+        return hidden_states, rotary_emb, mask_input
 
     def after_transformer_block(self, block_idx, hidden_states):
         if block_idx in self.audio_injector.injected_block_id.keys():
@@ -1618,7 +1628,7 @@ class WanS2VTransformer3DModel(nn.Module):
             self.audio_emb_global = encoder_hidden_states_audio["audio_emb_global"]
 
         # Patch embedding + ref tokens + mask
-        hidden_states, seq_lens, mask_input, post_patch_sizes = self.prepare_patch_embedding(
+        hidden_states, mask_input, post_patch_sizes = self.prepare_patch_embedding(
             hidden_states, ref_latents, cond_states
         )
 
@@ -1626,9 +1636,8 @@ class WanS2VTransformer3DModel(nn.Module):
         rotary_emb = self.prepare_rope(hidden_states, post_patch_sizes)
 
         # Inject motion tokens
-        hidden_states, seq_lens, rotary_emb, mask_input = self.inject_motion(
+        hidden_states, rotary_emb, mask_input = self.inject_motion(
             hidden_states,
-            seq_lens,
             rotary_emb,
             mask_input,
             motion_latents,
@@ -1647,12 +1656,12 @@ class WanS2VTransformer3DModel(nn.Module):
         temb, timestep_proj = self.timestep_proj_prepare(timestep_proj, temb, self.zero_timestep, self.original_seq_len)
 
         # Transformer blocks
+        # Note: hidden_states_mask=None since S2V uses fixed-size tensors without padding
         kwargs = dict(
-            timestep_proj=timestep_proj,
-            seq_lens=seq_lens,
-            freqs=rotary_emb,
+            temb=timestep_proj,
+            rotary_emb=rotary_emb,
             encoder_hidden_states=encoder_hidden_states,
-            context_lens=None,
+            hidden_states_mask=None,
         )
 
         for idx, block in enumerate(self.blocks):
