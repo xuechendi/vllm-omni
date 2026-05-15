@@ -53,8 +53,61 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
+@torch.compile
+def _compute_rope_freqs_3d(freqs_0_buf, freqs_1_buf, freqs_2_buf, f_sam, h_sam, w_sam, conjugate_f):
+    """Compilable helper: gather and expand 3D frequency grid.
+
+    This is the compute-intensive part that torch.compile can optimize:
+    - Gathers from frequency buffers using indices
+    - Expands to 3D grid
+    - Concatenates along feature dimension
+
+    Args:
+        freqs_0_buf: [max_seq_len, d0] frequency buffer for frame dim
+        freqs_1_buf: [max_seq_len, d1] frequency buffer for height dim
+        freqs_2_buf: [max_seq_len, d2] frequency buffer for width dim
+        f_sam: [seq_f] frame indices
+        h_sam: [seq_h] height indices
+        w_sam: [seq_w] width indices
+        conjugate_f: bool, whether to conjugate frame frequencies
+
+    Returns:
+        [seq_f * seq_h * seq_w, 1, d0+d1+d2] frequency tensor
+    """
+    seq_f = f_sam.shape[0]
+    seq_h = h_sam.shape[0]
+    seq_w = w_sam.shape[0]
+
+    # Gather frequencies
+    freqs_0 = freqs_0_buf[f_sam]  # [seq_f, d0]
+    if conjugate_f:
+        freqs_0 = freqs_0.conj()
+    freqs_0 = freqs_0.view(seq_f, 1, 1, -1)  # [seq_f, 1, 1, d0]
+
+    freqs_1 = freqs_1_buf[h_sam].view(1, seq_h, 1, -1)  # [1, seq_h, 1, d1]
+    freqs_2 = freqs_2_buf[w_sam].view(1, 1, seq_w, -1)  # [1, 1, seq_w, d2]
+
+    # Expand and concatenate
+    freqs_i = torch.cat(
+        [
+            freqs_0.expand(seq_f, seq_h, seq_w, -1),
+            freqs_1.expand(seq_f, seq_h, seq_w, -1),
+            freqs_2.expand(seq_f, seq_h, seq_w, -1),
+        ],
+        dim=-1,
+    )  # [seq_f, seq_h, seq_w, d0+d1+d2]
+
+    seq_len = seq_f * seq_h * seq_w
+    return freqs_i.reshape(seq_len, 1, -1)
+
+
 class WanS2VRotaryPosEmbed(nn.Module):
-    """Complex-valued rotary position embeddings for S2V multi-grid positions."""
+    """Complex-valued rotary position embeddings for S2V multi-grid positions.
+
+    The forward() method uses eager mode for control flow but delegates
+    compute-intensive operations to _compute_rope_freqs_3d() which is
+    torch.compile-optimized for better performance.
+    """
 
     def __init__(self, num_heads: int, head_dim: int, max_seq_len: int = 1024):
         super().__init__()
@@ -117,17 +170,9 @@ class WanS2VRotaryPosEmbed(nn.Module):
                         h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
                         w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
 
-                        freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
-                        freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
-
-                        freqs_i = torch.cat(
-                            [
-                                freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs[1][h_sam].view(1, seq_h_int, 1, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs[2][w_sam].view(1, 1, seq_w_int, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                            ],
-                            dim=-1,
-                        ).reshape(seq_len, 1, -1)
+                        # Use compiled helper for compute-intensive frequency gathering
+                        conjugate_f = f_o < 0
+                        freqs_i = _compute_rope_freqs_3d(freqs[0], freqs[1], freqs[2], f_sam, h_sam, w_sam, conjugate_f)
                     elif t_f < 0:
                         freqs_i = trainable_freqs.unsqueeze(1)
                     output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = freqs_i
