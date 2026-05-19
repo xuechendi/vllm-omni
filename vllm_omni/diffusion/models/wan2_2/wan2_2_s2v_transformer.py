@@ -375,70 +375,6 @@ class WanS2VTransformerBlock(nn.Module):
         # 6-way scale-shift modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def _apply_audio_injection(self, hidden_states: torch.Tensor, audio_injection_params: dict) -> torch.Tensor:
-        """Apply audio injection to hidden states inside the block.
-
-        This method is called within the transformer block to inject audio features
-        via cross-attention. When cache-dit is enabled, it caches the full residual
-        including audio effects.
-
-        Args:
-            hidden_states: Current block hidden states [B, S, D]
-            audio_injection_params: Dict containing:
-                - block_idx: Current block index
-                - injected_block_ids: Dict mapping block indices to audio attention IDs
-                - merged_audio_emb: Audio embeddings [B, T, N, D]
-                - original_seq_len: Sequence length before motion
-                - enable_adain: Whether AdaIN is enabled
-                - adain_mode: AdaIN mode ("attn_norm" or other)
-                - audio_emb_global: Global audio embeddings (if AdaIN enabled)
-                - injector: Audio cross-attention layers
-                - injector_pre_norm_feat: Pre-norm layers
-                - injector_adain_layers: AdaIN layers (if AdaIN enabled)
-
-        Returns:
-            Updated hidden states with audio injection applied
-        """
-        block_idx = audio_injection_params["block_idx"]
-        injected_block_ids = audio_injection_params["injected_block_ids"]
-
-        if block_idx not in injected_block_ids:
-            return hidden_states
-
-        audio_attn_id = injected_block_ids[block_idx]
-        audio_emb = audio_injection_params["merged_audio_emb"]
-        original_seq_len = audio_injection_params["original_seq_len"]
-        num_frames = audio_emb.shape[1]
-
-        input_hidden_states = hidden_states[:, :original_seq_len].clone()
-        input_hidden_states = rearrange(input_hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
-
-        # AdaIN or pre-norm
-        if audio_injection_params.get("enable_adain") and audio_injection_params.get("adain_mode") == "attn_norm":
-            audio_emb_global = audio_injection_params["audio_emb_global"]
-            audio_emb_global = rearrange(audio_emb_global, "b t n c -> (b t) n c")
-            injector_adain_layers = audio_injection_params["injector_adain_layers"]
-            attn_hidden_states = injector_adain_layers[audio_attn_id](input_hidden_states, temb=audio_emb_global[:, 0])
-        else:
-            injector_pre_norm_feat = audio_injection_params["injector_pre_norm_feat"]
-            attn_hidden_states = injector_pre_norm_feat[audio_attn_id](input_hidden_states)
-
-        audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c", t=num_frames)
-        attn_audio_emb = audio_emb
-
-        # Pass empty AttentionMetadata to ensure proper distributed ops coordination
-        audio_attn_metadata = AttentionMetadata()
-
-        injector = audio_injection_params["injector"]
-        residual_out = injector[audio_attn_id](
-            x=attn_hidden_states,
-            context=attn_audio_emb,
-            attn_metadata=audio_attn_metadata,
-        )
-        residual_out = rearrange(residual_out, "(b t) n c -> b (t n) c", t=num_frames)
-        hidden_states[:, :original_seq_len] = hidden_states[:, :original_seq_len] + residual_out
-        return hidden_states
-
     def forward(
         self,
         hidden_states,
@@ -446,6 +382,7 @@ class WanS2VTransformerBlock(nn.Module):
         temb,
         rotary_emb,
         hidden_states_mask: torch.Tensor | None = None,
+        self_attn_metadata: AttentionMetadata | None = None,
     ):
         seg_boundary = temb[1]
         seg_idx = [0, min(max(0, seg_boundary), hidden_states.size(1)), hidden_states.size(1)]
@@ -454,8 +391,9 @@ class WanS2VTransformerBlock(nn.Module):
         modulation = (self.modulation.unsqueeze(2).to(temb.dtype) + temb).chunk(6, dim=1)
         modulation = [element.squeeze(1) for element in modulation]
 
-        # Create attention metadata for self-attention
-        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
+        # Create attention metadata for self-attention (if not provided)
+        if self_attn_metadata is None:
+            self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
 
         # Self-attention with per-segment modulation
         norm_hidden_states = self.norm1(hidden_states).type_as(hidden_states)
@@ -1592,17 +1530,16 @@ class WanS2VTransformer3DModel(nn.Module):
             mask_input = torch.cat([mask_input, motion_mask], dim=1)
         return hidden_states, rotary_emb, mask_input
 
-    def after_transformer_block(self, block_idx, hidden_states):
+    def after_transformer_block(self, block_idx, hidden_states, merged_audio_emb, audio_emb_global=None):
         if block_idx in self.audio_injector.injected_block_id.keys():
             audio_attn_id = self.audio_injector.injected_block_id[block_idx]
-            audio_emb = self.merged_audio_emb
+            audio_emb = merged_audio_emb
             num_frames = audio_emb.shape[1]
 
-            input_hidden_states = hidden_states[:, : self.original_seq_len].clone()
+            input_hidden_states = hidden_states[:, : self.original_seq_len]
             input_hidden_states = rearrange(input_hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
 
             if self.enable_adain and self.adain_mode == "attn_norm":
-                audio_emb_global = self.audio_emb_global
                 audio_emb_global = rearrange(audio_emb_global, "b t n c -> (b t) n c")
                 adain_hidden_states = self.audio_injector.injector_adain_layers[audio_attn_id](
                     input_hidden_states, temb=audio_emb_global[:, 0]
@@ -1691,9 +1628,8 @@ class WanS2VTransformer3DModel(nn.Module):
         add_last_motion = self.add_last_motion * add_last_motion
 
         # Audio embeddings (must be precomputed via encode_audio())
-        self.merged_audio_emb = encoder_hidden_states_audio["audio_emb"]
-        if self.enable_adain:
-            self.audio_emb_global = encoder_hidden_states_audio["audio_emb_global"]
+        merged_audio_emb = encoder_hidden_states_audio["audio_emb"]
+        audio_emb_global = encoder_hidden_states_audio.get("audio_emb_global") if self.enable_adain else None
 
         # Patch embedding + ref tokens + mask
         hidden_states, mask_input, post_patch_sizes = self.prepare_patch_embedding(
@@ -1736,7 +1672,7 @@ class WanS2VTransformer3DModel(nn.Module):
         for idx, block in enumerate(self.blocks):
             hidden_states = block(hidden_states, encoder_hidden_states, **kwargs)
             # Audio injection happens OUTSIDE the block (audio_outside strategy)
-            hidden_states = self.after_transformer_block(idx, hidden_states)
+            hidden_states = self.after_transformer_block(idx, hidden_states, merged_audio_emb, audio_emb_global)
 
         # Output norm, projection & unpatchify
         hidden_states = hidden_states[:, : self.original_seq_len]
