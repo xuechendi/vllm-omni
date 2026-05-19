@@ -241,6 +241,55 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
     return refresh_cache_context
 
 
+def enable_cache_for_wan_s2v(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for Wan2.2 S2V (Speech-to-Video) pipeline.
+
+    WanS2V uses a single transformer (no transformer_2) with Pattern_2 blocks.
+    Similar to single-transformer Wan2.2 T2V/I2V, but dedicated to speech-to-video generation.
+
+    Args:
+        pipeline: The Wan22S2VPipeline instance.
+        cache_config: DiffusionCacheConfig instance with cache configuration.
+
+    Returns:
+        A refresh function that can be called to update cache context with new num_inference_steps.
+    """
+    logger.info("Enabling cache-dit for Wan2.2 S2V single transformer")
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=pipeline.transformer,
+            blocks=[pipeline.transformer.blocks],
+            forward_pattern=[ForwardPattern.Pattern_2],
+            params_modifiers=[
+                ParamsModifier(cache_config=db_cache_config),
+            ],
+            has_separate_cfg=True,
+        ),
+        cache_config=db_cache_config,
+    )
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        """Refresh cache context for single S2V transformer."""
+        if cache_config.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+        else:
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                cache_config=DBCacheConfig().reset(
+                    num_inference_steps=num_inference_steps,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=cache_config.scm_steps_mask_policy, total_steps=num_inference_steps
+                    ),
+                    steps_computation_policy=cache_config.scm_steps_policy,
+                ),
+                verbose=verbose,
+            )
+
+    return refresh_cache_context
+
+
 def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for LongCatImage pipeline.
 
@@ -1444,6 +1493,7 @@ CUSTOM_DIT_ENABLERS.update(
         "Wan22Pipeline": enable_cache_for_wan22,
         "Wan22I2VPipeline": enable_cache_for_wan22,
         "Wan22TI2VPipeline": enable_cache_for_wan22,
+        "Wan22S2VPipeline": enable_cache_for_wan_s2v,
         "HunyuanImage3Pipeline": enable_cache_for_hunyuan_image3,
         "FluxPipeline": enable_cache_for_flux,
         "Flux2KleinPipeline": enable_cache_for_flux2_klein,
