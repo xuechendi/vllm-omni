@@ -426,11 +426,14 @@ class WanS2VTransformerBlock(nn.Module):
         audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c", t=num_frames)
         attn_audio_emb = audio_emb
 
+        # Pass empty AttentionMetadata to ensure proper distributed ops coordination
+        audio_attn_metadata = AttentionMetadata()
+
         injector = audio_injection_params["injector"]
         residual_out = injector[audio_attn_id](
             x=attn_hidden_states,
             context=attn_audio_emb,
-            attn_metadata=None,  # No masking needed for audio cross-attention
+            attn_metadata=audio_attn_metadata,
         )
         residual_out = rearrange(residual_out, "(b t) n c -> b (t n) c", t=num_frames)
         hidden_states[:, :original_seq_len] = hidden_states[:, :original_seq_len] + residual_out
@@ -1615,15 +1618,10 @@ class WanS2VTransformer3DModel(nn.Module):
 
             audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c", t=num_frames)
             attn_audio_emb = audio_emb
-            # Create attention metadata with context sequence lengths for cross-attention
-            audio_attn_metadata = AttentionMetadata(
-                context_lens=torch.full(
-                    (attn_hidden_states.shape[0],),
-                    attn_audio_emb.shape[1],
-                    dtype=torch.long,
-                    device=attn_hidden_states.device,
-                )
-            )
+
+            # Pass empty AttentionMetadata to ensure proper distributed ops coordination
+            audio_attn_metadata = AttentionMetadata()
+
             residual_out = self.audio_injector.injector[audio_attn_id](
                 x=attn_hidden_states,
                 context=attn_audio_emb,
