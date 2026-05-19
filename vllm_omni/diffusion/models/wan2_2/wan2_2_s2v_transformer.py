@@ -446,7 +446,6 @@ class WanS2VTransformerBlock(nn.Module):
         temb,
         rotary_emb,
         hidden_states_mask: torch.Tensor | None = None,
-        audio_injection_params: dict | None = None,
     ):
         seg_boundary = temb[1]
         seg_idx = [0, min(max(0, seg_boundary), hidden_states.size(1)), hidden_states.size(1)]
@@ -493,10 +492,6 @@ class WanS2VTransformerBlock(nn.Module):
         for i in range(2):
             ffn_output_parts.append(ffn_output[:, seg_idx[i] : seg_idx[i + 1]] * modulation[5][:, i : i + 1])
         hidden_states = hidden_states + torch.cat(ffn_output_parts, dim=1)
-
-        # Apply audio injection if configured (audio_inside strategy)
-        if audio_injection_params is not None:
-            hidden_states = self._apply_audio_injection(hidden_states, audio_injection_params)
 
         return hidden_states
 
@@ -1730,20 +1725,6 @@ class WanS2VTransformer3DModel(nn.Module):
 
         # Transformer blocks
         # Note: hidden_states_mask=None since S2V uses fixed-size tensors without padding
-
-        # Prepare audio injection params for blocks
-        audio_injection_params = {
-            "injected_block_ids": self.audio_injector.injected_block_id,
-            "merged_audio_emb": self.merged_audio_emb,
-            "audio_emb_global": self.audio_emb_global if self.enable_adain else None,
-            "original_seq_len": self.original_seq_len,
-            "enable_adain": self.enable_adain,
-            "adain_mode": self.adain_mode if self.enable_adain else None,
-            "injector": self.audio_injector.injector,
-            "injector_pre_norm_feat": self.audio_injector.injector_pre_norm_feat,
-            "injector_adain_layers": self.audio_injector.injector_adain_layers if self.enable_adain else None,
-        }
-
         # Cache-dit expects: block(hidden_states, encoder_hidden_states, *args, **kwargs)
         # So pass encoder_hidden_states as 2nd positional arg for cache-dit compatibility
         kwargs = dict(
@@ -1753,13 +1734,9 @@ class WanS2VTransformer3DModel(nn.Module):
         )
 
         for idx, block in enumerate(self.blocks):
-            # Pass block_idx in audio_injection_params
-            audio_injection_params["block_idx"] = idx
-            hidden_states = block(
-                hidden_states, encoder_hidden_states, **kwargs, audio_injection_params=audio_injection_params
-            )
-            # Audio injection now happens INSIDE the block, so skip after_transformer_block
-            # hidden_states = self.after_transformer_block(idx, hidden_states)  # DISABLED
+            hidden_states = block(hidden_states, encoder_hidden_states, **kwargs)
+            # Audio injection happens OUTSIDE the block (audio_outside strategy)
+            hidden_states = self.after_transformer_block(idx, hidden_states)
 
         # Output norm, projection & unpatchify
         hidden_states = hidden_states[:, : self.original_seq_len]
