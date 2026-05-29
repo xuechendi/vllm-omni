@@ -8,15 +8,14 @@ Audio and motion modules use standard nn.Linear (no TP needed).
 
 import math
 from collections.abc import Iterable
-from copy import deepcopy
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention import AdaLayerNorm
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
-from einops import rearrange, repeat
+from einops import rearrange
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -31,6 +30,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid, RotaryEmbeddingWanS2V
 from vllm_omni.platforms import current_omni_platform
 
 from .wan2_2_transformer import DistributedRMSNorm, WanFeedForward
@@ -53,171 +53,87 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-@torch.amp.autocast(current_omni_platform.device_type, enabled=False)
-def rope_params(max_seq_len, dim, theta=10000):
-    if dim % 2 != 0:
-        raise ValueError(f"dim ({dim}) must be even")
-    freqs = torch.outer(
-        torch.arange(max_seq_len), 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim))
-    )
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
+class WanS2VRotaryPosEmbed(nn.Module):
+    """Complex-valued rotary position embeddings for S2V multi-grid positions."""
 
+    def __init__(self, num_heads: int, head_dim: int, max_seq_len: int = 1024):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        d = head_dim
+        freqs = torch.cat(
+            [
+                self._rope_params(max_seq_len, d - 4 * (d // 6)),
+                self._rope_params(max_seq_len, 2 * (d // 6)),
+                self._rope_params(max_seq_len, 2 * (d // 6)),
+            ],
+            dim=1,
+        )
+        self.register_buffer("freqs", freqs.to(torch.complex64), persistent=False)
 
-def rope_precompute(x, grid_sizes, freqs, start=None):
-    """Precompute complex-valued RoPE embeddings for S2V multi-grid positions."""
-    b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
+    @staticmethod
+    @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
+    def _rope_params(max_seq_len, dim, theta=10000):
+        if dim % 2 != 0:
+            raise ValueError(f"dim ({dim}) must be even")
+        freqs = torch.outer(
+            torch.arange(max_seq_len), 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim))
+        )
+        return torch.polar(torch.ones_like(freqs), freqs)
 
-    if isinstance(freqs, list):
-        trainable_freqs = freqs[1]
-        freqs = freqs[0]
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    def forward(self, hidden_states, grid_sizes, trainable_freqs=None):
+        b, s = hidden_states.shape[0], hidden_states.shape[1]
+        c = self.head_dim // 2
+        device = hidden_states.device
 
-    # Allocate output on CPU to avoid GPU OOM from the large complex buffer,
-    # then move to device at the end. Use complex64 (float32 pairs) to halve
-    # memory vs the original complex128 — sufficient precision for RoPE.
-    output = torch.zeros(b, s, n, c, dtype=torch.complex64, device="cpu")
-    seq_bucket = [0]
-    if not isinstance(grid_sizes, list):
-        grid_sizes = [grid_sizes]
-    for g in grid_sizes:
-        if not isinstance(g, list):
-            g = [torch.zeros_like(g), g]
-        batch_size = g[0].shape[0]
-        for i in range(batch_size):
-            if start is None:
+        freqs = self.freqs.to(device)
+        freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+        # Store only 1 head — RoPE freqs are identical across heads.
+        # RotaryEmbeddingWanS2V broadcasts via freqs[:, :seq, :n].
+        output = torch.zeros(b, s, 1, c, dtype=torch.complex64, device=device)
+        seq_bucket = [0]
+        if not isinstance(grid_sizes, list):
+            grid_sizes = [grid_sizes]
+        for g in grid_sizes:
+            if not isinstance(g, list):
+                g = [torch.zeros_like(g), g]
+            batch_size = g[0].shape[0]
+            for i in range(batch_size):
                 f_o, h_o, w_o = g[0][i]
-            else:
-                f_o, h_o, w_o = start[i]
+                f, h, w = g[1][i]
+                t_f, t_h, t_w = g[2][i]
+                seq_f, seq_h, seq_w = f - f_o, h - h_o, w - w_o
+                seq_len = int(seq_f * seq_h * seq_w)
+                if seq_len > 0:
+                    if t_f > 0:
+                        seq_f_int = int(seq_f)
+                        seq_h_int = int(seq_h)
+                        seq_w_int = int(seq_w)
 
-            f, h, w = g[1][i]
-            t_f, t_h, t_w = g[2][i]
-            seq_f, seq_h, seq_w = f - f_o, h - h_o, w - w_o
-            seq_len = int(seq_f * seq_h * seq_w)
-            if seq_len > 0:
-                if t_f > 0:
-                    if f_o >= 0:
-                        f_sam = np.linspace(f_o.item(), (t_f + f_o).item() - 1, seq_f).astype(int).tolist()
-                    else:
-                        f_sam = np.linspace(-f_o.item(), (-t_f - f_o).item() + 1, seq_f).astype(int).tolist()
-                    h_sam = np.linspace(h_o.item(), (t_h + h_o).item() - 1, seq_h).astype(int).tolist()
-                    w_sam = np.linspace(w_o.item(), (t_w + w_o).item() - 1, seq_w).astype(int).tolist()
+                        if f_o >= 0:
+                            f_sam = torch.linspace(int(f_o), int(t_f + f_o) - 1, seq_f_int, device=device).long()
+                        else:
+                            f_sam = torch.linspace(int(-f_o), int(-t_f - f_o) + 1, seq_f_int, device=device).long()
+                        h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
+                        w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
 
-                    assert f_o * f >= 0 and h_o * h >= 0 and w_o * w >= 0
-                    freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
-                    freqs_0 = freqs_0.view(seq_f, 1, 1, -1)
+                        freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
+                        freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
 
-                    freqs_i = torch.cat(
-                        [
-                            freqs_0.expand(seq_f, seq_h, seq_w, -1),
-                            freqs[1][h_sam].view(1, seq_h, 1, -1).expand(seq_f, seq_h, seq_w, -1),
-                            freqs[2][w_sam].view(1, 1, seq_w, -1).expand(seq_f, seq_h, seq_w, -1),
-                        ],
-                        dim=-1,
-                    ).reshape(seq_len, 1, -1)
-                elif t_f < 0:
-                    freqs_i = trainable_freqs.unsqueeze(1)
-                output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = freqs_i
-        seq_bucket.append(seq_bucket[-1] + seq_len)
-    return output
-
-
-@torch.amp.autocast(current_omni_platform.device_type, enabled=False)
-def rope_apply(x, grid_sizes, freqs, start=None):
-    """Apply RoPE using grid-based frequency computation (for motioner/init)."""
-    n, c = x.size(2), x.size(3) // 2
-    input_dtype = x.dtype
-
-    if isinstance(freqs, list):
-        trainable_freqs = freqs[1]
-        freqs = freqs[0]
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    output = x.clone()
-    seq_bucket = [0]
-    if not isinstance(grid_sizes, list):
-        grid_sizes = [grid_sizes]
-    for g in grid_sizes:
-        if not isinstance(g, list):
-            g = [torch.zeros_like(g), g]
-        batch_size = g[0].shape[0]
-        for i in range(batch_size):
-            if start is None:
-                f_o, h_o, w_o = g[0][i]
-            else:
-                f_o, h_o, w_o = start[i]
-
-            f, h, w = g[1][i]
-            t_f, t_h, t_w = g[2][i]
-            seq_f, seq_h, seq_w = f - f_o, h - h_o, w - w_o
-            seq_len = int(seq_f * seq_h * seq_w)
-            if seq_len > 0:
-                if t_f > 0:
-                    if f_o >= 0:
-                        f_sam = np.linspace(f_o.item(), (t_f + f_o).item() - 1, seq_f).astype(int).tolist()
-                    else:
-                        f_sam = np.linspace(-f_o.item(), (-t_f - f_o).item() + 1, seq_f).astype(int).tolist()
-                    h_sam = np.linspace(h_o.item(), (t_h + h_o).item() - 1, seq_h).astype(int).tolist()
-                    w_sam = np.linspace(w_o.item(), (t_w + w_o).item() - 1, seq_w).astype(int).tolist()
-
-                    assert f_o * f >= 0 and h_o * h >= 0 and w_o * w >= 0
-                    freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
-                    freqs_0 = freqs_0.view(seq_f, 1, 1, -1)
-
-                    freqs_i = torch.cat(
-                        [
-                            freqs_0.expand(seq_f, seq_h, seq_w, -1),
-                            freqs[1][h_sam].view(1, seq_h, 1, -1).expand(seq_f, seq_h, seq_w, -1),
-                            freqs[2][w_sam].view(1, 1, seq_w, -1).expand(seq_f, seq_h, seq_w, -1),
-                        ],
-                        dim=-1,
-                    ).reshape(seq_len, 1, -1)
-                elif t_f < 0:
-                    freqs_i = trainable_freqs.unsqueeze(1)
-                x_i = torch.view_as_complex(
-                    x[i, seq_bucket[-1] : seq_bucket[-1] + seq_len].to(torch.float32).reshape(seq_len, n, -1, 2)
-                )
-                x_i = torch.view_as_real(x_i * freqs_i.to(torch.complex64)).flatten(2)
-                output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = x_i
-        seq_bucket.append(seq_bucket[-1] + seq_len)
-    return output.to(input_dtype)
-
-
-@torch.compiler.disable
-@torch.amp.autocast(current_omni_platform.device_type, enabled=False)
-def rope_apply_s2v(x, grid_sizes, freqs, start=None):
-    """Apply RoPE using precomputed complex freqs (for S2V main transformer).
-
-    Under TP, x has fewer heads than freqs (which is precomputed with all heads).
-    Since RoPE frequencies are identical across heads, we slice freqs to match.
-    """
-    n = x.size(2)
-    input_dtype = x.dtype
-    output = []
-    for i, _ in enumerate(x):
-        s = x.size(1)
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float32).reshape(s, n, -1, 2))
-        freqs_i = freqs[i, :s, :n].to(dtype=torch.complex64, device=x.device)
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
-        output.append(x_i)
-    return torch.stack(output).to(input_dtype)
-
-
-@torch.amp.autocast(current_omni_platform.device_type, enabled=False)
-def rope_apply_usp(x, grid_sizes, freqs):
-    """Apply RoPE for Ulysses sequence parallel (context parallel mode)."""
-    n = x.size(2)
-    input_dtype = x.dtype
-    output = []
-    for i, _ in enumerate(x):
-        s = x.size(1)
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float32).reshape(s, n, -1, 2))
-        freqs_i = freqs[i, :, :n].to(dtype=torch.complex64, device=x.device)
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
-        output.append(x_i)
-    return torch.stack(output).to(input_dtype)
+                        freqs_i = torch.cat(
+                            [
+                                freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                freqs[1][h_sam].view(1, seq_h_int, 1, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                freqs[2][w_sam].view(1, 1, seq_w_int, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                            ],
+                            dim=-1,
+                        ).reshape(seq_len, 1, -1)
+                    elif t_f < 0:
+                        freqs_i = trainable_freqs.unsqueeze(1)
+                    output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = freqs_i
+            seq_bucket.append(seq_bucket[-1] + seq_len)
+        return output
 
 
 def zero_module(module):
@@ -286,6 +202,9 @@ class WanS2VSelfAttention(nn.Module):
             return_bias=False,
         )
 
+        # Rotary embedding
+        self.rotary_embedding = RotaryEmbeddingWanS2V()
+
         # Unified attention layer
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -295,7 +214,7 @@ class WanS2VSelfAttention(nn.Module):
             causal=False,
         )
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, freqs):
         b, s = x.shape[:2]
 
         # Fused QKV
@@ -313,16 +232,13 @@ class WanS2VSelfAttention(nn.Module):
         key = key.view(b, s, self.num_kv_heads, self.head_dim)
         value = value.view(b, s, self.num_kv_heads, self.head_dim)
 
-        # Apply S2V complex-valued RoPE
-        query = rope_apply_s2v(query, grid_sizes, freqs)
-        key = rope_apply_s2v(key, grid_sizes, freqs)
+        # Apply RoPE
+        query = self.rotary_embedding(query, freqs)
+        key = self.rotary_embedding(key, freqs)
 
-        # Reshape back after rope (rope_apply_s2v preserves [B, S, N, D])
         query = query.view(b, s, self.num_heads, self.head_dim)
         key = key.view(b, s, self.num_kv_heads, self.head_dim)
 
-        # Attention — rope_apply_s2v preserves input dtype (bf16), so
-        # query/key/value are all bf16 here, matching FlashAttention requirements.
         hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(x)
@@ -414,64 +330,112 @@ class WanS2VTransformerBlock(nn.Module):
         # 6-way scale-shift modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
-        seg_boundary = e[1]
+    def forward(self, x, timestep_proj, seq_lens, freqs, encoder_hidden_states, context_lens):
+        seg_boundary = timestep_proj[1]
         seg_idx = [0, min(max(0, seg_boundary), x.size(1)), x.size(1)]
-        e = e[0]
+        timestep_proj = timestep_proj[0]
 
-        # Modulation parameters — self.modulation will be cast to match e's dtype
-        e = (self.modulation.unsqueeze(2).to(e.dtype) + e).chunk(6, dim=1)
-        e = [element.squeeze(1) for element in e]
+        modulation = (self.modulation.unsqueeze(2).to(timestep_proj.dtype) + timestep_proj).chunk(6, dim=1)
+        modulation = [element.squeeze(1) for element in modulation]
 
         # Self-attention with per-segment modulation
         norm_x = self.norm1(x).type_as(x)
         parts = []
         for i in range(2):
-            parts.append(norm_x[:, seg_idx[i] : seg_idx[i + 1]] * (1 + e[1][:, i : i + 1]) + e[0][:, i : i + 1])
+            parts.append(
+                norm_x[:, seg_idx[i] : seg_idx[i + 1]] * (1 + modulation[1][:, i : i + 1]) + modulation[0][:, i : i + 1]
+            )
         norm_x = torch.cat(parts, dim=1)
 
-        y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs)
+        y = self.self_attn(norm_x, seq_lens, freqs)
         y_parts = []
         for i in range(2):
-            y_parts.append(y[:, seg_idx[i] : seg_idx[i + 1]] * e[2][:, i : i + 1])
+            y_parts.append(y[:, seg_idx[i] : seg_idx[i + 1]] * modulation[2][:, i : i + 1])
         x = x + torch.cat(y_parts, dim=1)
 
         # Cross-attention
-        x = x + self.cross_attn(self.norm3(x).type_as(x), context, context_lens)
+        x = x + self.cross_attn(self.norm3(x).type_as(x), encoder_hidden_states, context_lens)
 
         # FFN with per-segment modulation
         norm2_x = self.norm2(x).type_as(x)
         parts = []
         for i in range(2):
-            parts.append(norm2_x[:, seg_idx[i] : seg_idx[i + 1]] * (1 + e[4][:, i : i + 1]) + e[3][:, i : i + 1])
+            parts.append(
+                norm2_x[:, seg_idx[i] : seg_idx[i + 1]] * (1 + modulation[4][:, i : i + 1])
+                + modulation[3][:, i : i + 1]
+            )
         norm2_x = torch.cat(parts, dim=1)
         y = self.ffn(norm2_x)
         y_parts = []
         for i in range(2):
-            y_parts.append(y[:, seg_idx[i] : seg_idx[i + 1]] * e[5][:, i : i + 1])
+            y_parts.append(y[:, seg_idx[i] : seg_idx[i + 1]] * modulation[5][:, i : i + 1])
         x = x + torch.cat(y_parts, dim=1)
         return x
 
 
-class WanS2VHead(nn.Module):
-    """S2V output head with modulation."""
+class WanS2VOutputScaleShiftPrepare(nn.Module):
+    """Prepares output scale/shift from temb for S2V output modulation."""
 
-    def __init__(self, dim, out_dim, patch_size, eps=1e-6):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+
+    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        shift, scale = (self.scale_shift_table.to(temb.dtype) + temb.unsqueeze(1)).chunk(2, dim=1)
+        return shift, scale
+
+
+class WanS2VTimestepProjPrepare(nn.Module):
+    """Prepares timestep_proj with segment modulation for S2V."""
+
+    def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-        self.out_dim = out_dim
-        self.patch_size = patch_size
 
-        out_dim_full = math.prod(patch_size) * out_dim
-        self.norm = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.head = nn.Linear(dim, out_dim_full)
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+    def forward(self, timestep_proj: torch.Tensor, temb: torch.Tensor, zero_timestep: bool, seg_boundary: int):
+        timestep_proj = timestep_proj.unflatten(1, (6, self.dim))
+        if zero_timestep:
+            temb = temb[:-1]
+            zero_timestep_proj = timestep_proj[-1:]
+            timestep_proj = timestep_proj[:-1]
+            timestep_proj = torch.cat(
+                [
+                    timestep_proj.unsqueeze(2),
+                    zero_timestep_proj.unsqueeze(2).repeat(timestep_proj.size(0), 1, 1, 1),
+                ],
+                dim=2,
+            )
+            return temb, [timestep_proj, seg_boundary]
+        else:
+            timestep_proj = timestep_proj.unsqueeze(2).repeat(1, 1, 2, 1)
+            return temb, [timestep_proj, 0]
 
-    def forward(self, x, e):
-        e = (self.modulation.to(e.dtype) + e.unsqueeze(1)).chunk(2, dim=1)
-        x = self.norm(x).type_as(x) * (1 + e[1]) + e[0]
-        x = self.head(x)
-        return x
+
+class WanS2VConditionEmbedder(nn.Module):
+    """Combined time and text condition embeddings for S2V."""
+
+    def __init__(self, dim: int, freq_dim: int, text_dim: int, text_len: int):
+        super().__init__()
+        self.freq_dim = freq_dim
+        self.text_len = text_len
+        self.time_embedder = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        self.text_embedder = nn.Sequential(nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim))
+
+    def forward(
+        self,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        hidden_states_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        temb = self.time_embedder(sinusoidal_embedding_1d(self.freq_dim, timestep).to(hidden_states_dtype))
+        timestep_proj = self.time_proj(temb)
+        encoder_hidden_states = self.text_embedder(
+            torch.stack(
+                [torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in encoder_hidden_states]
+            )
+        )
+        return temb, timestep_proj, encoder_hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -576,43 +540,10 @@ class CausalAudioEncoder(nn.Module):
         return res
 
 
-class AudioCrossAttention(nn.Module):
-    """Audio cross-attention using nn.Linear (no TP needed)."""
+class AudioCrossAttention(WanS2VCrossAttention):
+    """Audio cross-attention — same as WanS2VCrossAttention (TP-aware)."""
 
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
-        if dim % num_heads != 0:
-            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.o = nn.Linear(dim, dim)
-        self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-
-        self.attn = Attention(
-            num_heads=num_heads,
-            head_size=self.head_dim,
-            num_kv_heads=num_heads,
-            softmax_scale=1.0 / (self.head_dim**0.5),
-            causal=False,
-        )
-
-    def forward(self, x: torch.Tensor, context: torch.Tensor, context_lens: list[int] | None = None) -> torch.Tensor:
-        b, n, d = x.size(0), self.num_heads, self.head_dim
-
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-
-        x = self.attn(q, k, v)
-        x = x.flatten(2, 3)
-        x = self.o(x)
-        return x
+    pass
 
 
 class AudioInjector_WAN(nn.Module):
@@ -694,6 +625,7 @@ class SimpleSelfAttention(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
         )
+        self.rotary_embedding = RotaryEmbeddingS2VGrid()
 
     def forward(
         self, x: torch.Tensor, seq_lens: list[int], grid_sizes: list[tuple[int, int, int]], freqs: torch.Tensor
@@ -704,10 +636,9 @@ class SimpleSelfAttention(nn.Module):
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
 
-        q = rope_apply(q, grid_sizes, freqs)
-        k = rope_apply(k, grid_sizes, freqs)
+        q = self.rotary_embedding(q, grid_sizes, freqs)
+        k = self.rotary_embedding(k, grid_sizes, freqs)
 
-        # rope_apply preserves [B, S, N, D] shape and input dtype
         q = q.view(b, s, n, d)
         k = k.view(b, s, n, d)
 
@@ -722,42 +653,45 @@ class SwinSelfAttention(SimpleSelfAttention):
         self, x: torch.Tensor, seq_lens: list[int], grid_sizes: list[tuple[int, int, int]], freqs: torch.Tensor
     ) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        if b != 1:
-            raise ValueError(
-                f"SwinSelfAttention only supports batch_size=1, got batch_size={b}. "
-                "Batched inference requires refactoring the frame reference and rearrange logic."
-            )
 
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
 
-        q = rope_apply(q, grid_sizes, freqs)
-        k = rope_apply(k, grid_sizes, freqs)
+        q = self.rotary_embedding(q, grid_sizes, freqs)
+        k = self.rotary_embedding(k, grid_sizes, freqs)
         q = q.view(b, s, n, d)
         k = k.view(b, s, n, d)
         T, H, W = grid_sizes[0].tolist()
 
-        q = rearrange(q, "b (t h w) n d -> (b t) (h w) n d", t=T, h=H, w=W)
-        k = rearrange(k, "b (t h w) n d -> (b t) (h w) n d", t=T, h=H, w=W)
-        v = rearrange(v, "b (t h w) n d -> (b t) (h w) n d", t=T, h=H, w=W)
+        q = rearrange(q, "b (t h w) n d -> b t (h w) n d", t=T, h=H, w=W)
+        k = rearrange(k, "b (t h w) n d -> b t (h w) n d", t=T, h=H, w=W)
+        v = rearrange(v, "b (t h w) n d -> b t (h w) n d", t=T, h=H, w=W)
 
-        # Skip ref_q (last frame query) - unused in current implementation
-        q = q[:-1]
+        # Per-batch: skip ref_q (last frame), build swin k/v with ref frame
+        q_frames = q[:, :-1]  # [b, T-1, HW, n, d]
+        ref_k = k[:, -1:].expand(-1, T - 1, -1, -1, -1)  # [b, T-1, HW, n, d]
+        ref_v = v[:, -1:].expand(-1, T - 1, -1, -1, -1)
 
-        ref_k = repeat(k[-1:], "1 s n d -> t s n d", t=k.shape[0] - 1)
-        k = k[:-1]
-        k = torch.cat([k[:1], k, k[-1:]])
-        k = torch.cat([k[1:-1], k[2:], k[:-2], ref_k], dim=1)
+        k_frames = k[:, :-1]  # [b, T-1, HW, n, d]
+        k_pad = torch.cat([k_frames[:, :1], k_frames, k_frames[:, -1:]], dim=1)  # [b, T+1, HW, n, d]
+        k_frames = torch.cat([k_pad[:, 1:-1], k_pad[:, 2:], k_pad[:, :-2], ref_k], dim=2)
 
-        ref_v = repeat(v[-1:], "1 s n d -> t s n d", t=v.shape[0] - 1)
-        v = v[:-1]
-        v = torch.cat([v[:1], v, v[-1:]])
-        v = torch.cat([v[1:-1], v[2:], v[:-2], ref_v], dim=1)
+        v_frames = v[:, :-1]
+        v_pad = torch.cat([v_frames[:, :1], v_frames, v_frames[:, -1:]], dim=1)
+        v_frames = torch.cat([v_pad[:, 1:-1], v_pad[:, 2:], v_pad[:, :-2], ref_v], dim=2)
 
-        out = self.attn(q, k, v)
-        out = torch.cat([out, ref_v[:1]], axis=0)
-        out = rearrange(out, "(b t) (h w) n d -> b (t h w) n d", t=T, h=H, w=W)
+        # Flatten batch and time for attention: [b*(T-1), HW, n, d] / [b*(T-1), 4*HW, n, d]
+        q_flat = rearrange(q_frames, "b t s n d -> (b t) s n d")
+        k_flat = rearrange(k_frames, "b t s n d -> (b t) s n d")
+        v_flat = rearrange(v_frames, "b t s n d -> (b t) s n d")
+
+        out = self.attn(q_flat, k_flat, v_flat)
+        out = rearrange(out, "(b t) s n d -> b t s n d", b=b)
+        # Append ref frame output (use ref_v as identity since ref_q was skipped)
+        ref_out = v[:, -1:]  # [b, 1, HW, n, d]
+        out = torch.cat([out, ref_out], dim=1)  # [b, T, HW, n, d]
+        out = rearrange(out, "b t (h w) n d -> b (t h w) n d", h=H, w=W)
         x = out.flatten(2, 3)
         x = self.o(x)
         return x
@@ -769,11 +703,6 @@ class CausalSelfAttention(SimpleSelfAttention):
     ) -> torch.Tensor:
         shifting = 3
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        if b != 1:
-            raise ValueError(
-                f"CausalSelfAttention only supports batch_size=1, got batch_size={b}. "
-                "Batched inference requires refactoring the causal masking and frame reference logic."
-            )
 
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
@@ -781,55 +710,62 @@ class CausalSelfAttention(SimpleSelfAttention):
 
         T, H, W = grid_sizes[0].tolist()
 
-        q = rearrange(q, "b (t h w) n d -> (b t) (h w) n d", t=T, h=H, w=W)
-        k = rearrange(k, "b (t h w) n d -> (b t) (h w) n d", t=T, h=H, w=W)
-        v = rearrange(v, "b (t h w) n d -> (b t) (h w) n d", t=T, h=H, w=W)
+        q = rearrange(q, "b (t h w) n d -> b t (h w) n d", t=T, h=H, w=W)
+        k = rearrange(k, "b (t h w) n d -> b t (h w) n d", t=T, h=H, w=W)
+        v = rearrange(v, "b (t h w) n d -> b t (h w) n d", t=T, h=H, w=W)
 
-        # Skip ref_q (last frame query) - unused in current causal implementation
-        q = q[:-1]
+        num_frames = T - 1  # exclude ref frame
 
-        grid_sizes_q = torch.tensor([[1, H, W]] * q.shape[0], dtype=torch.long)
-        start = [[shifting, 0, 0]] * q.shape[0]
-        q = rope_apply(q, grid_sizes_q, freqs, start=start)
-        q = q.view(q.shape[0], -1, n, d)
+        # Query: skip ref frame, apply RoPE per frame
+        q_frames = rearrange(q[:, :-1], "b t s n d -> (b t) s n d")
+        grid_sizes_q = torch.tensor([[1, H, W]] * (b * num_frames), dtype=torch.long)
+        start = [[shifting, 0, 0]] * (b * num_frames)
+        q_frames = self.rotary_embedding(q_frames, grid_sizes_q, freqs, start=start)
+        q_frames = q_frames.view(b * num_frames, -1, n, d)
 
-        ref_k = k[-1:]
-        grid_sizes_ref = torch.tensor([[1, H, W]], dtype=torch.long)
-        start_ref = [[shifting + 10, 0, 0]]
-        ref_k = rope_apply(ref_k, grid_sizes_ref, freqs, start_ref)
-        ref_k = ref_k.view(1, -1, n, d)
-        ref_k = repeat(ref_k, "1 s n d -> t s n d", t=k.shape[0] - 1)
+        # Ref key: one per batch, RoPE with shifted start, expand to all frames
+        ref_k = rearrange(k[:, -1:], "b 1 s n d -> b s n d")
+        grid_sizes_ref = torch.tensor([[1, H, W]] * b, dtype=torch.long)
+        start_ref = [[shifting + 10, 0, 0]] * b
+        ref_k = self.rotary_embedding(ref_k, grid_sizes_ref, freqs, start_ref)
+        ref_k = ref_k.view(b, 1, -1, n, d).expand(-1, num_frames, -1, -1, -1)
+        ref_k = rearrange(ref_k, "b t s n d -> (b t) s n d")
 
-        k = k[:-1]
-        k = torch.cat([*([k[:1]] * shifting), k])
+        # Causal key: pad with shifting duplicates, gather shifting+1 neighboring frames
+        k_frames = k[:, :-1]  # [b, T-1, HW, n, d]
+        k_pad = torch.cat([k_frames[:, :1].expand(-1, shifting, -1, -1, -1), k_frames], dim=1)  # [b, T-1+shifting, ...]
         cat_k = []
         for i in range(shifting):
-            cat_k.append(k[i : i - shifting])
-        cat_k.append(k[shifting:])
-        k = torch.cat(cat_k, dim=1)
+            cat_k.append(k_pad[:, i : i + num_frames])
+        cat_k.append(k_pad[:, shifting:])
+        k_causal = torch.cat(cat_k, dim=2)  # [b, T-1, (shifting+1)*HW, n, d]
+        k_causal = rearrange(k_causal, "b t s n d -> (b t) s n d")
 
-        grid_sizes_k = torch.tensor([[shifting + 1, H, W]] * (q.shape[0]), dtype=torch.long)
-        k = rope_apply(k, grid_sizes_k, freqs)
-        k = k.view(k.shape[0], -1, n, d)
-        k = torch.cat([k, ref_k], dim=1)
+        grid_sizes_k = torch.tensor([[shifting + 1, H, W]] * (b * num_frames), dtype=torch.long)
+        k_causal = self.rotary_embedding(k_causal, grid_sizes_k, freqs)
+        k_causal = k_causal.view(b * num_frames, -1, n, d)
+        k_causal = torch.cat([k_causal, ref_k], dim=1)
 
-        ref_v = repeat(v[-1:], "1 s n d -> t s n d", t=q.shape[0])
-        v = v[:-1]
-        v = torch.cat([*([v[:1]] * shifting), v])
+        # Causal value: same padding structure as key, plus ref
+        ref_v = v[:, -1:].expand(-1, num_frames, -1, -1, -1)
+        ref_v_flat = rearrange(ref_v, "b t s n d -> (b t) s n d")
+        v_frames = v[:, :-1]
+        v_pad = torch.cat([v_frames[:, :1].expand(-1, shifting, -1, -1, -1), v_frames], dim=1)
         cat_v = []
         for i in range(shifting):
-            cat_v.append(v[i : i - shifting])
-        cat_v.append(v[shifting:])
-        v = torch.cat(cat_v, dim=1)
-        v = torch.cat([v, ref_v], dim=1)
+            cat_v.append(v_pad[:, i : i + num_frames])
+        cat_v.append(v_pad[:, shifting:])
+        v_causal = torch.cat(cat_v, dim=2)
+        v_causal = rearrange(v_causal, "b t s n d -> (b t) s n d")
+        v_causal = torch.cat([v_causal, ref_v_flat], dim=1)
 
-        outs = []
-        for i in range(q.shape[0]):
-            out = self.attn(q[i : i + 1], k[i : i + 1], v[i : i + 1])
-            outs.append(out)
-        out = torch.cat(outs, dim=0)
-        out = torch.cat([out, ref_v[:1]], axis=0)
-        out = rearrange(out, "(b t) (h w) n d -> b (t h w) n d", t=T, h=H, w=W)
+        # Attention per frame (batched)
+        out = self.attn(q_frames, k_causal, v_causal)
+        out = rearrange(out, "(b t) s n d -> b t s n d", b=b)
+        # Append ref frame output
+        ref_out = v[:, -1:]  # [b, 1, HW, n, d]
+        out = torch.cat([out, ref_out], dim=1)  # [b, T, HW, n, d]
+        out = rearrange(out, "b t (h w) n d -> b (t h w) n d", h=H, w=W)
         x = out.flatten(2, 3)
         x = self.o(x)
         return x
@@ -938,10 +874,7 @@ class MotionerTransformers(nn.Module):
         if (dim // num_heads) % 2 != 0:
             raise ValueError(f"dim // num_heads ({dim // num_heads}) must be even")
         d = dim // num_heads
-        self.freqs = torch.cat(
-            [rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)), rope_params(1024, 2 * (d // 6))],
-            dim=1,
-        )
+        self.rope = WanS2VRotaryPosEmbed(num_heads=num_heads, head_dim=d, max_seq_len=1024)
 
         self.gradient_checkpointing = False
         self.motion_side_len = int(math.sqrt(motion_token_num))
@@ -960,17 +893,13 @@ class MotionerTransformers(nn.Module):
                     torch.tensor([1, self.motion_side_len, self.motion_side_len]).unsqueeze(0).repeat(1, 1),
                 ]
             ]
-            token_freqs = rope_apply(x, gride_sizes, self.freqs)
+            token_freqs = RotaryEmbeddingS2VGrid.forward(x, gride_sizes, self.rope.freqs)
             token_freqs = token_freqs[0, :, 0].reshape(motion_token_num, -1, 2)
             token_freqs = token_freqs * 0.01
             self.token_freqs = torch.nn.Parameter(token_freqs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x[0].shape[1] contains motion frames count, but not used directly here
-        device = self.patch_embedding.weight.device
-        freqs = self.freqs
-        if freqs.device != device:
-            freqs = freqs.to(device)
+        freqs = self.rope.freqs
 
         if self.trainable_token_pos_emb:
             with torch.amp.autocast(current_omni_platform.device_type, dtype=torch.float64):
@@ -1066,10 +995,7 @@ class FramePackMotioner(nn.Module):
         if (inner_dim // num_heads) % 2 != 0:
             raise ValueError(f"inner_dim // num_heads ({inner_dim // num_heads}) must be even")
         d = inner_dim // num_heads
-        self.freqs = torch.cat(
-            [rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)), rope_params(1024, 2 * (d // 6))],
-            dim=1,
-        )
+        self.rope = WanS2VRotaryPosEmbed(num_heads=num_heads, head_dim=d, max_seq_len=1024)
         self.drop_mode = drop_mode
 
     def forward(self, motion_latents: torch.Tensor, add_last_motion: int = 2) -> torch.Tensor:
@@ -1150,12 +1076,7 @@ class FramePackMotioner(nn.Module):
 
             grid_sizes = grid_sizes + grid_sizes_2x + grid_sizes_4x
 
-            motion_rope_emb = rope_precompute(
-                motion_lat.detach().view(1, motion_lat.shape[1], self.num_heads, self.inner_dim // self.num_heads),
-                grid_sizes,
-                self.freqs,
-                start=None,
-            )
+            motion_rope_emb = self.rope(motion_lat, grid_sizes)
 
             mot.append(motion_lat)
             mot_remb.append(motion_rope_emb)
@@ -1267,9 +1188,8 @@ class WanS2VTransformer3DModel(nn.Module):
 
         # Embeddings
         self.patch_embedding = nn.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size)
-        self.text_embedding = nn.Sequential(nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim))
-        self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-        self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        self.condition_embedder = WanS2VConditionEmbedder(dim, freq_dim, text_dim, text_len)
+        self.timestep_proj_prepare = WanS2VTimestepProjPrepare(dim)
 
         # Transformer blocks (TP-enabled)
         self.blocks = nn.ModuleList(
@@ -1280,7 +1200,9 @@ class WanS2VTransformer3DModel(nn.Module):
         )
 
         # Output head
-        self.head = WanS2VHead(dim, out_dim, patch_size, eps)
+        self.norm_out = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.proj_out = nn.Linear(dim, math.prod(patch_size) * out_dim)
+        self.output_scale_shift_prepare = WanS2VOutputScaleShiftPrepare(dim)
 
         # RoPE base frequencies (complex-valued)
         if dim % num_heads != 0:
@@ -1288,10 +1210,9 @@ class WanS2VTransformer3DModel(nn.Module):
         if (dim // num_heads) % 2 != 0:
             raise ValueError(f"dim // num_heads ({dim // num_heads}) must be even")
         d = dim // num_heads
-        self.freqs = torch.cat(
-            [rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)), rope_params(1024, 2 * (d // 6))],
-            dim=1,
-        )
+        self.rope = WanS2VRotaryPosEmbed(num_heads=num_heads, head_dim=d, max_seq_len=1024)
+        self._cached_rope_emb = None
+        self._cached_rope_resolution = None
 
         self.use_context_parallel = False
 
@@ -1319,7 +1240,7 @@ class WanS2VTransformer3DModel(nn.Module):
         )
         self.adain_mode = adain_mode
 
-        self.trainable_cond_mask = nn.Embedding(3, dim)
+        self.cond_type_embed = nn.Embedding(3, dim)
 
         if zero_init:
             self._zero_init_weights()
@@ -1372,7 +1293,7 @@ class WanS2VTransformer3DModel(nn.Module):
                         .repeat(1, 1),
                     ]
                 ]
-                token_freqs = rope_apply(x, gride_sizes, self.freqs)
+                token_freqs = RotaryEmbeddingS2VGrid.forward(x, gride_sizes, self.rope.freqs)
                 token_freqs = token_freqs[0, :, 0].reshape(motion_token_num, -1, 2)
                 token_freqs = token_freqs * 0.01
                 self.token_freqs = nn.Parameter(token_freqs)
@@ -1385,69 +1306,105 @@ class WanS2VTransformer3DModel(nn.Module):
 
     def _zero_init_weights(self):
         with torch.no_grad():
-            self.trainable_cond_mask = zero_module(self.trainable_cond_mask)
+            self.cond_type_embed = zero_module(self.cond_type_embed)
             if hasattr(self, "cond_encoder"):
                 self.cond_encoder = zero_module(self.cond_encoder)
             for i in range(len(self.audio_injector.injector)):
-                self.audio_injector.injector[i].o = zero_module(self.audio_injector.injector[i].o)
+                self.audio_injector.injector[i].to_out = zero_module(self.audio_injector.injector[i].to_out)
                 if self.enable_adain:
                     self.audio_injector.injector_adain_layers[i].linear = zero_module(
                         self.audio_injector.injector_adain_layers[i].linear
                     )
 
     # ------------------------------------------------------------------
+    # Patch embedding preparation
+    # ------------------------------------------------------------------
+
+    def prepare_patch_embedding(self, hidden_states, ref_latents, cond_states):
+        """Patch-embed noisy + ref latents, flatten to sequence, and build token mask."""
+        hidden_states = self.patch_embedding(hidden_states) + self.cond_encoder(cond_states)
+        batch_size = hidden_states.shape[0]
+        post_patch_sizes = torch.tensor([list(hidden_states.shape[2:])], dtype=torch.long).repeat(batch_size, 1)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        self.original_seq_len = hidden_states.shape[1]
+        seq_lens = torch.full((batch_size,), self.original_seq_len, dtype=torch.long)
+
+        ref = self.patch_embedding(ref_latents).flatten(2).transpose(1, 2)
+        hidden_states = torch.cat([hidden_states, ref], dim=1)
+        seq_lens = seq_lens + ref.shape[1]
+
+        mask_input = torch.zeros(batch_size, hidden_states.shape[1], dtype=torch.long, device=hidden_states.device)
+        mask_input[:, self.original_seq_len :] = 1
+
+        return hidden_states, seq_lens, mask_input, post_patch_sizes
+
+    # ------------------------------------------------------------------
+    # RoPE preparation
+    # ------------------------------------------------------------------
+
+    def prepare_rope(self, hidden_states, post_patch_sizes):
+        """Precompute RoPE for hidden_states (noisy + ref tokens already concatenated)."""
+        current_rope_resolution = tuple(post_patch_sizes[0].tolist())
+        if self._cached_rope_resolution == current_rope_resolution and self._cached_rope_emb is not None:
+            rotary_emb = self._cached_rope_emb
+        else:
+            batch_size = hidden_states.shape[0]
+            height, width = post_patch_sizes[0, 1].item(), post_patch_sizes[0, 2].item()
+
+            rope_grid_sizes = [
+                [torch.zeros_like(post_patch_sizes), post_patch_sizes, post_patch_sizes],
+                [
+                    torch.tensor([30, 0, 0]).unsqueeze(0).repeat(batch_size, 1),
+                    torch.tensor([31, height, width]).unsqueeze(0).repeat(batch_size, 1),
+                    torch.tensor([1, height, width]).unsqueeze(0).repeat(batch_size, 1),
+                ],
+            ]
+
+            rotary_emb = self.rope(hidden_states, rope_grid_sizes)
+            self._cached_rope_resolution = current_rope_resolution
+            self._cached_rope_emb = rotary_emb
+        return rotary_emb
+
+    # ------------------------------------------------------------------
     # Motion processing
     # ------------------------------------------------------------------
 
     def process_motion(self, motion_latents, drop_motion_frames=False):
-        if drop_motion_frames or motion_latents[0].shape[1] == 0:
-            return [], []
-        self.lat_motion_frames = motion_latents[0].shape[1]
-        mot = [self.patch_embedding(m.unsqueeze(0)) for m in motion_latents]
-        batch_size = len(mot)
-        mot_remb = []
-        flatten_mot = []
-        for bs in range(batch_size):
-            height, width = mot[bs].shape[3], mot[bs].shape[4]
-            flat_mot = mot[bs].flatten(2).transpose(1, 2).contiguous()
-            motion_grid_sizes = [
-                [
-                    torch.tensor([-self.lat_motion_frames, 0, 0]).unsqueeze(0).repeat(1, 1),
-                    torch.tensor([0, height, width]).unsqueeze(0).repeat(1, 1),
-                    torch.tensor([self.lat_motion_frames, height, width]).unsqueeze(0).repeat(1, 1),
-                ]
+        if drop_motion_frames or motion_latents.shape[2] == 0:
+            return None, None
+        lat_motion_frames = motion_latents.shape[2]
+        mot = self.patch_embedding(motion_latents)
+        height, width = mot.shape[3], mot.shape[4]
+        mot = mot.flatten(2).transpose(1, 2).contiguous()
+        motion_grid_sizes = [
+            [
+                torch.tensor([-lat_motion_frames, 0, 0]).unsqueeze(0).repeat(mot.shape[0], 1),
+                torch.tensor([0, height, width]).unsqueeze(0).repeat(mot.shape[0], 1),
+                torch.tensor([lat_motion_frames, height, width]).unsqueeze(0).repeat(mot.shape[0], 1),
             ]
-            motion_rope_emb = rope_precompute(
-                flat_mot.detach().view(1, flat_mot.shape[1], self.num_heads, self.dim // self.num_heads),
-                motion_grid_sizes,
-                self.freqs,
-                start=None,
-            )
-            mot_remb.append(motion_rope_emb)
-            flatten_mot.append(flat_mot)
-        return flatten_mot, mot_remb
+        ]
+        mot_remb = self.rope(mot, motion_grid_sizes)
+        return mot, mot_remb
 
     def process_motion_frame_pack(self, motion_latents, drop_motion_frames=False, add_last_motion=2):
         flatten_mot, mot_remb = self.frame_packer(motion_latents, add_last_motion)
+        mot = torch.cat(flatten_mot, dim=0)
+        mot_remb = torch.cat(mot_remb, dim=0)
         if drop_motion_frames:
-            return [m[:, :0] for m in flatten_mot], [m[:, :0] for m in mot_remb]
-        else:
-            return flatten_mot, mot_remb
+            return mot[:, :0], mot_remb[:, :0]
+        return mot, mot_remb
 
     def process_motion_transformer_motioner(self, motion_latents, drop_motion_frames=False, add_last_motion=True):
         batch_size = len(motion_latents)
         height = motion_latents[0].shape[2] // self.patch_size[1]
         width = motion_latents[0].shape[3] // self.patch_size[2]
 
-        freqs = self.freqs
-        device = self.patch_embedding.weight.device
-        if freqs.device != device:
-            freqs = freqs.to(device)
+        trainable_freqs = None
         if self.trainable_token_pos_emb:
             with torch.amp.autocast(current_omni_platform.device_type, dtype=torch.float64):
                 token_freqs = self.token_freqs.to(torch.float64)
                 token_freqs = token_freqs / token_freqs.norm(dim=-1, keepdim=True)
-                freqs = [freqs, torch.view_as_complex(token_freqs)]
+                trainable_freqs = torch.view_as_complex(token_freqs)
 
         if not drop_motion_frames and add_last_motion:
             last_motion_latent = [u[:, -1:] for u in motion_latents]
@@ -1486,16 +1443,18 @@ class WanS2VTransformer3DModel(nn.Module):
         mot = torch.cat([last_mot, zip_motion], dim=1)
         gride_sizes = gride_sizes + zip_motion_grid_sizes
 
-        motion_rope_emb = rope_precompute(
-            mot.detach().view(batch_size, mot.shape[1], self.num_heads, self.dim // self.num_heads),
-            gride_sizes,
-            freqs,
-            start=None,
-        )
-        return [m.unsqueeze(0) for m in mot], [r.unsqueeze(0) for r in motion_rope_emb]
+        motion_rope_emb = self.rope(mot, gride_sizes, trainable_freqs=trainable_freqs)
+        return mot, motion_rope_emb
 
     def inject_motion(
-        self, x, seq_lens, rope_embs, mask_input, motion_latents, drop_motion_frames=False, add_last_motion=True
+        self,
+        hidden_states,
+        seq_lens,
+        rotary_emb,
+        mask_input,
+        motion_latents,
+        drop_motion_frames=False,
+        add_last_motion=True,
     ):
         if self.enable_motioner:
             mot, mot_remb = self.process_motion_transformer_motioner(
@@ -1508,15 +1467,16 @@ class WanS2VTransformer3DModel(nn.Module):
         else:
             mot, mot_remb = self.process_motion(motion_latents, drop_motion_frames=drop_motion_frames)
 
-        if len(mot) > 0:
-            x = [torch.cat([u, m], dim=1) for u, m in zip(x, mot)]
-            seq_lens = seq_lens + torch.tensor([r.size(1) for r in mot], dtype=torch.long)
-            rope_embs = [torch.cat([u, m], dim=1) for u, m in zip(rope_embs, mot_remb)]
-            mask_input = [
-                torch.cat([m, 2 * torch.ones([1, u.shape[1] - m.shape[1]], device=m.device, dtype=m.dtype)], dim=1)
-                for m, u in zip(mask_input, x)
-            ]
-        return x, seq_lens, rope_embs, mask_input
+        if mot is not None and mot.shape[1] > 0:
+            motion_len = mot.shape[1]
+            hidden_states = torch.cat([hidden_states, mot], dim=1)
+            seq_lens = seq_lens + motion_len
+            rotary_emb = torch.cat([rotary_emb, mot_remb], dim=1)
+            motion_mask = 2 * torch.ones(
+                mask_input.shape[0], motion_len, device=mask_input.device, dtype=mask_input.dtype
+            )
+            mask_input = torch.cat([mask_input, motion_mask], dim=1)
+        return hidden_states, seq_lens, rotary_emb, mask_input
 
     def after_transformer_block(self, block_idx, hidden_states):
         if block_idx in self.audio_injector.injected_block_id.keys():
@@ -1581,168 +1541,97 @@ class WanS2VTransformer3DModel(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        context: torch.Tensor,
-        seq_len: int,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
         ref_latents: torch.Tensor,
         motion_latents: torch.Tensor,
         cond_states: torch.Tensor,
-        audio_input: torch.Tensor | None = None,
-        motion_frames: list[int] = [17, 5],
+        encoder_hidden_states_audio: dict[str, torch.Tensor] | None = None,
         add_last_motion: int = 2,
         drop_motion_frames: bool = False,
-        audio_emb: dict[str, torch.Tensor] | None = None,
-        *extra_args: object,
-        **extra_kwargs: object,
-    ) -> torch.Tensor:
+        attention_kwargs: dict | None = None,
+        return_dict: bool = True,
+    ) -> torch.Tensor | Transformer2DModelOutput:
         """Forward pass for S2V transformer.
 
         Args:
-            x: Noisy latents [B, C, T, H, W]
-            t: Timesteps [B]
-            context: Text embeddings [B, seq_len, dim]
-            seq_len: Sequence length
+            hidden_states: Noisy latents [B, C, T, H, W]
+            timestep: Timesteps [B]
+            encoder_hidden_states: Text embeddings [B, seq_len, dim]
             ref_latents: Reference image latents [B, C, 1, H, W]
             motion_latents: Motion context latents [B, C, T_motion, H, W]
-            cond_states: Pose condition latents [B, C, T, H, W] — typically zero tensor
-                        for no pose control. Iterates over batch dimension (dim 0).
-            audio_input: Raw audio features (optional if audio_emb provided)
-            motion_frames: [num_frames, num_latent_frames] for audio alignment
+            cond_states: Pose condition latents [B, C, T, H, W]
+            encoder_hidden_states_audio: Precomputed audio embeddings from encode_audio()
             add_last_motion: Number of last motion frames to repeat
             drop_motion_frames: Whether to drop first motion frame
-            audio_emb: Precomputed audio embeddings from encode_audio()
+            attention_kwargs: Additional attention arguments (unused, for API compat)
+            return_dict: Whether to return dict (unused, for API compat)
 
         Returns:
             Predicted noise [B, C, T, H, W]
         """
         add_last_motion = self.add_last_motion * add_last_motion
 
-        # Audio encoding — use precomputed embeddings if available
-        if audio_emb is not None:
-            self.merged_audio_emb = audio_emb["audio_emb"]
-            if self.enable_adain:
-                self.audio_emb_global = audio_emb["audio_emb_global"]
-        else:
-            audio_input = torch.cat(
-                [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
-                dim=-1,
-            )
-            audio_emb_res = self.casual_audio_encoder(audio_input)
-            if self.enable_adain:
-                audio_emb_global, audio_emb_local = audio_emb_res
-                self.audio_emb_global = audio_emb_global[:, motion_frames[1] :].clone()
-            else:
-                audio_emb_local = audio_emb_res
-            self.merged_audio_emb = audio_emb_local[:, motion_frames[1] :, :]
+        # Audio embeddings (must be precomputed via encode_audio())
+        self.merged_audio_emb = encoder_hidden_states_audio["audio_emb"]
+        if self.enable_adain:
+            self.audio_emb_global = encoder_hidden_states_audio["audio_emb_global"]
 
-        # Patch embedding + condition
-        # NOTE: x and cond_states are 5D tensors [B, C, T, H, W]. Iterating over them
-        # yields 4D tensors [C, T, H, W], which we unsqueeze(0) to restore batch dim.
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]
-        x = [x_ + pose for x_, pose in zip(x, cond)]
-
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-
-        original_grid_sizes = deepcopy(grid_sizes)
-        grid_sizes = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
-
-        # Reference image tokens
-        self.lat_motion_frames = motion_latents[0].shape[1]
-        ref = [self.patch_embedding(r.unsqueeze(0)) for r in ref_latents]
-        batch_size = len(ref)
-        height, width = ref[0].shape[3], ref[0].shape[4]
-        ref_grid_sizes = [
-            [
-                torch.tensor([30, 0, 0]).unsqueeze(0).repeat(batch_size, 1),
-                torch.tensor([31, height, width]).unsqueeze(0).repeat(batch_size, 1),
-                torch.tensor([1, height, width]).unsqueeze(0).repeat(batch_size, 1),
-            ]
-        ]
-
-        ref = [r.flatten(2).transpose(1, 2) for r in ref]
-        self.original_seq_len = seq_lens[0].item()
-
-        seq_lens = seq_lens + torch.tensor([r.size(1) for r in ref], dtype=torch.long)
-        grid_sizes = grid_sizes + ref_grid_sizes
-        x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)]
-
-        # Masks: 0=noisy, 1=ref, 2=motion
-        mask_input = [torch.zeros([1, u.shape[1]], dtype=torch.long, device=x[0].device) for u in x]
-        for i in range(len(mask_input)):
-            mask_input[i][:, self.original_seq_len :] = 1
+        # Patch embedding + ref tokens + mask
+        hidden_states, seq_lens, mask_input, post_patch_sizes = self.prepare_patch_embedding(
+            hidden_states, ref_latents, cond_states
+        )
 
         # Precompute RoPE
-        x = torch.cat(x)
-        b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
-        self.pre_compute_freqs = rope_precompute(x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None)
-
-        x = [u.unsqueeze(0) for u in x]
-        self.pre_compute_freqs = [u.unsqueeze(0) for u in self.pre_compute_freqs]
+        rotary_emb = self.prepare_rope(hidden_states, post_patch_sizes)
 
         # Inject motion tokens
-        x, seq_lens, self.pre_compute_freqs, mask_input = self.inject_motion(
-            x,
+        hidden_states, seq_lens, rotary_emb, mask_input = self.inject_motion(
+            hidden_states,
             seq_lens,
-            self.pre_compute_freqs,
+            rotary_emb,
             mask_input,
             motion_latents,
             drop_motion_frames=drop_motion_frames,
             add_last_motion=add_last_motion,
         )
 
-        x = torch.cat(x, dim=0)
-        self.pre_compute_freqs = torch.cat(self.pre_compute_freqs, dim=0)
-        mask_input = torch.cat(mask_input, dim=0)
+        hidden_states = hidden_states + self.cond_type_embed(mask_input).to(hidden_states.dtype)
 
-        x = x + self.trainable_cond_mask(mask_input).to(x.dtype)
-
-        # Time embeddings — sinusoidal_embedding_1d uses float64 internally
-        # for precision, then we cast to the model dtype (bf16) since the
-        # downstream scale/shift modulation doesn't need float32.
+        # Condition embeddings (time + text)
         if self.zero_timestep:
-            t = torch.cat([t, torch.zeros([1], dtype=t.dtype, device=t.device)])
-        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).to(x.dtype))
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-
-        if self.zero_timestep:
-            e = e[:-1]
-            zero_e0 = e0[-1:]
-            e0 = e0[:-1]
-            e0 = torch.cat([e0.unsqueeze(2), zero_e0.unsqueeze(2).repeat(e0.size(0), 1, 1, 1)], dim=2)
-            e0 = [e0, self.original_seq_len]
-        else:
-            e0 = e0.unsqueeze(2).repeat(1, 1, 2, 1)
-            e0 = [e0, 0]
-
-        # Context embedding
-        context_lens = None
-        context = self.text_embedding(
-            torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
+            timestep = torch.cat([timestep, torch.zeros([1], dtype=timestep.dtype, device=timestep.device)])
+        temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
+            timestep, encoder_hidden_states, hidden_states.dtype
         )
+        temb, timestep_proj = self.timestep_proj_prepare(timestep_proj, temb, self.zero_timestep, self.original_seq_len)
 
         # Transformer blocks
         kwargs = dict(
-            e=e0,
+            timestep_proj=timestep_proj,
             seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            freqs=self.pre_compute_freqs,
-            context=context,
-            context_lens=context_lens,
+            freqs=rotary_emb,
+            encoder_hidden_states=encoder_hidden_states,
+            context_lens=None,
         )
 
         for idx, block in enumerate(self.blocks):
-            x = block(x, **kwargs)
-            x = self.after_transformer_block(idx, x)
+            hidden_states = block(hidden_states, **kwargs)
+            hidden_states = self.after_transformer_block(idx, hidden_states)
 
-        # Output
-        x = x[:, : self.original_seq_len]
-        x = self.head(x, e)
-        x = self.unpatchify(x, original_grid_sizes)
-        return [u.float() for u in x]
+        # Output norm, projection & unpatchify
+        hidden_states = hidden_states[:, : self.original_seq_len]
+        shift, scale = self.output_scale_shift_prepare(temb)
+        hidden_states = self.norm_out(hidden_states).type_as(hidden_states) * (1 + scale) + shift
+        hidden_states = self.proj_out(hidden_states)
+        output = self.unpatchify(hidden_states, post_patch_sizes)
+        output = torch.stack([u.float() for u in output])
+
+        if not return_dict:
+            return (output,)
+
+        return Transformer2DModelOutput(sample=output)
 
     def unpatchify(self, x, grid_sizes):
         c = self.out_dim
@@ -1805,26 +1694,39 @@ class WanS2VTransformer3DModel(nn.Module):
                 name = name.replace(".ffn.0.", ".ffn.net_0.proj.")
                 name = name.replace(".ffn.2.", ".ffn.net_2.")
 
+            # Name remapping for condition_embedder (top-level only)
+            if name.startswith("time_embedding."):
+                name = "condition_embedder.time_embedder." + name[len("time_embedding.") :]
+            elif name.startswith("time_projection.") or name.startswith("timestep_projection."):
+                prefix = "time_projection." if name.startswith("time_projection.") else "timestep_projection."
+                name = "condition_embedder.time_proj." + name[len(prefix) :]
+            elif name.startswith("text_embedding."):
+                name = "condition_embedder.text_embedder." + name[len("text_embedding.") :]
+            name = name.replace("trainable_cond_mask.", "cond_type_embed.")
+
+            # Name remapping for output head -> norm_out + proj_out + output_scale_shift_prepare
+            if name.startswith("head.norm."):
+                name = "norm_out." + name[len("head.norm.") :]
+            elif name.startswith("head.head."):
+                name = "proj_out." + name[len("head.head.") :]
+            elif name == "head.modulation":
+                name = "output_scale_shift_prepare.scale_shift_table"
+
+            # Name remapping for audio injector (AudioCrossAttention)
+            if "audio_injector.injector." in name:
+                name = name.replace(".q.", ".to_q.")
+                name = name.replace(".k.", ".to_k.")
+                name = name.replace(".v.", ".to_v.")
+                name = name.replace(".o.", ".to_out.")
+
             if name not in params_dict:
                 logger.warning(f"Skipping weight {original_name} -> {name}")
                 continue
 
             param = params_dict[name]
 
-            # TP-shard norm weights for main blocks
-            if (
-                tp_size > 1
-                and is_main_block
-                and any(
-                    norm_name in name
-                    for norm_name in [
-                        ".self_attn.norm_q.",
-                        ".self_attn.norm_k.",
-                        ".cross_attn.norm_q.",
-                        ".cross_attn.norm_k.",
-                    ]
-                )
-            ):
+            # TP-shard norm weights for TP-aware attention modules
+            if tp_size > 1 and (".norm_q." in name or ".norm_k." in name):
                 shard_size = loaded_weight.shape[0] // tp_size
                 loaded_weight = loaded_weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 

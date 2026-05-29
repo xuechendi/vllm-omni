@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+import os
 import queue
 import threading
 import time
@@ -690,10 +691,14 @@ class DiffusionEngine:
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
-        # Audio pipelines round audio token count from num_frames; the default
-        # of 1 yields seq_len=1 K/V which cuDNN SDPA refuses under torch.compile.
-        # 2 is the minimum that produces audio_num_frames > 1.
-        num_frames = 2 if supports_audio_input or supports_audio_output(self.od_config.model_class_name) else 1
+        # Determine num_frames for warmup. Configurable via od_config.warmup_num_frames
+        # or VLLM_DIFFUSION_WARMUP_NUM_FRAMES env var. Defaults: audio/speech models
+        # need >=5 to produce non-zero latent frames after motion subtraction.
+        num_frames = self.od_config.warmup_num_frames
+        if num_frames is None:
+            num_frames = int(os.environ.get("VLLM_DIFFUSION_WARMUP_NUM_FRAMES", "0"))
+        if num_frames <= 0:
+            num_frames = 5 if supports_audio_input or supports_audio_output(self.od_config.model_class_name) else 1
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
