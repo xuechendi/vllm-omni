@@ -73,7 +73,10 @@ def rope_precompute(x, grid_sizes, freqs, start=None):
         freqs = freqs[0]
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    output = torch.view_as_complex(x.detach().reshape(b, s, n, -1, 2).to(torch.float64))
+    # Allocate output on CPU to avoid GPU OOM from the large complex buffer,
+    # then move to device at the end. Use complex64 (float32 pairs) to halve
+    # memory vs the original complex128 — sufficient precision for RoPE.
+    output = torch.zeros(b, s, n, c, dtype=torch.complex64, device="cpu")
     seq_bucket = [0]
     if not isinstance(grid_sizes, list):
         grid_sizes = [grid_sizes]
@@ -172,9 +175,9 @@ def rope_apply(x, grid_sizes, freqs, start=None):
                 elif t_f < 0:
                     freqs_i = trainable_freqs.unsqueeze(1)
                 x_i = torch.view_as_complex(
-                    x[i, seq_bucket[-1] : seq_bucket[-1] + seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
+                    x[i, seq_bucket[-1] : seq_bucket[-1] + seq_len].to(torch.float32).reshape(seq_len, n, -1, 2)
                 )
-                x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+                x_i = torch.view_as_real(x_i * freqs_i.to(torch.complex64)).flatten(2)
                 output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = x_i
         seq_bucket.append(seq_bucket[-1] + seq_len)
     return output.to(input_dtype)
@@ -193,8 +196,8 @@ def rope_apply_s2v(x, grid_sizes, freqs, start=None):
     output = []
     for i, _ in enumerate(x):
         s = x.size(1)
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
-        freqs_i = freqs[i, :s, :n]
+        x_i = torch.view_as_complex(x[i, :s].to(torch.float32).reshape(s, n, -1, 2))
+        freqs_i = freqs[i, :s, :n].to(dtype=torch.complex64, device=x.device)
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         x_i = torch.cat([x_i, x[i, s:]])
         output.append(x_i)
@@ -209,8 +212,8 @@ def rope_apply_usp(x, grid_sizes, freqs):
     output = []
     for i, _ in enumerate(x):
         s = x.size(1)
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
-        freqs_i = freqs[i, :, :n]
+        x_i = torch.view_as_complex(x[i, :s].to(torch.float32).reshape(s, n, -1, 2))
+        freqs_i = freqs[i, :, :n].to(dtype=torch.complex64, device=x.device)
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         x_i = torch.cat([x_i, x[i, s:]])
         output.append(x_i)
