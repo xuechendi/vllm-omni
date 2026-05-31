@@ -1134,6 +1134,34 @@ class Wan22S2VPipeline(
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
 
+        import os
+
+        _mem_debug = os.environ.get("VLLM_S2V_MEM_DEBUG", "0") == "1"
+
+        def _log_mem(tag):
+            if not _mem_debug:
+                return
+            import torch
+
+            dev = self.device
+            if dev.type == "xpu":
+                torch.xpu.synchronize(dev)
+                alloc = torch.xpu.memory_allocated(dev) / 1024**3
+                reserved = torch.xpu.memory_reserved(dev) / 1024**3
+                free = torch.xpu.mem_get_info(dev)[0] / 1024**3
+            else:
+                alloc = reserved = free = 0
+            msg = f"[PIPE MEM][{dev}] {tag:<45s} alloc={alloc:.2f}GB reserved={reserved:.2f}GB free={free:.2f}GB\n"
+            with open(f"/workspace/vllm-omni/s2v_mem_pipeline_{dev.index or 0}.log", "a") as f:
+                f.write(msg)
+
+        # unconditional write to verify file I/O works from workers
+        _dev_idx = device.index if hasattr(device, "index") and device.index is not None else 0
+        with open(f"/workspace/vllm-omni/s2v_mem_test_{_dev_idx}.log", "a") as _f:
+            _f.write(f"forward called on {device}, _mem_debug={_mem_debug}\n")
+
+        _log_mem("start of forward (after empty_cache)")
+
         if generator is None:
             generator = req.sampling_params.generator
         seed = req.sampling_params.seed
@@ -1158,6 +1186,8 @@ class Wan22S2VPipeline(
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
 
+        _log_mem("after text encoding")
+
         # ---- 2. Audio encoding ----
         audio_emb, audio_num_repeat, target_video_frames = self.encode_audio(
             audio_path, infer_frames=infer_frames, device=device, dtype=dtype
@@ -1171,6 +1201,8 @@ class Wan22S2VPipeline(
             raw_audio_sr = 16000
         else:
             raw_audio_waveform, raw_audio_sr = load_audio(audio_path, sr=None, mono=True)
+
+        _log_mem("after audio encoding")
 
         # ---- 3. Reference image encoding ----
         ref_latents = self.encode_ref_image(image, height, width, device=device).to(dtype=dtype)
@@ -1200,6 +1232,20 @@ class Wan22S2VPipeline(
         # Full pose video reading/encoding (WanS2V.load_pose_cond) would be
         # ported here in a future iteration when pose support is needed.
         # For now, we support the default zero-condition path.
+
+        # Offload audio_model and VAE to CPU — they're done encoding and
+        # won't be needed until VAE decode (VAE is brought back per-clip).
+        # Only offload when cpu_offload is active (tight memory scenario).
+        # Detect by checking if the transformer has an offload hook installed.
+        _do_manual_offload = hasattr(self.transformer, "_hook_registry")
+
+        if _do_manual_offload:
+            if hasattr(self, "audio_model") and self.audio_model is not None:
+                self.audio_model.to("cpu")
+            self.vae.to("cpu")
+            if current_omni_platform.is_available():
+                current_omni_platform.empty_cache()
+            _log_mem("after offloading audio_model+vae to CPU")
 
         # ---- 6. Multi-clip autoregressive denoising ----
         clips: list[torch.Tensor] = []
@@ -1248,26 +1294,15 @@ class Wan22S2VPipeline(
             # Max sequence length for the transformer
             max_seq_len = int(np.prod([lat_target_frames, lat_h, lat_w]) // 4)
 
-            # -- Precompute audio embeddings once per clip --
+            # -- Audio embeddings --
+            # Pass raw audio to the transformer forward, which encodes it
+            # internally (after the offload hook moves it to GPU).
             mf = [motion_frames, lat_motion_frames]
-            # When CPU offload is active the transformer lives on CPU until
-            # its __call__ hook fires.  encode_audio() bypasses __call__,
-            # so move the audio sub-module to GPU explicitly.
-            _audio_enc = getattr(self.transformer, "casual_audio_encoder", None)
-            _audio_on_cpu = _audio_enc is not None and next(_audio_enc.parameters()).device.type == "cpu"
-            if _audio_on_cpu:
-                _audio_enc.to(device)
-            param_dtype = next(self.transformer.parameters()).dtype
-            with torch.amp.autocast(device.type, dtype=param_dtype):
-                positive_audio_emb = self.transformer.encode_audio(audio_input, mf)
             do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
-            if do_true_cfg:
-                with torch.amp.autocast(device.type, dtype=param_dtype):
-                    negative_audio_emb = self.transformer.encode_audio(0.0 * audio_input, mf)
-            else:
-                negative_audio_emb = None
-            if _audio_on_cpu:
-                _audio_enc.to("cpu")
+            positive_audio_emb = {"audio_input": audio_input, "motion_frames": mf}
+            negative_audio_emb = {"audio_input": 0.0 * audio_input, "motion_frames": mf} if do_true_cfg else None
+
+            _log_mem("before diffuse loop")
 
             # -- Denoising loop --
             latents = self.diffuse(
@@ -1290,6 +1325,10 @@ class Wan22S2VPipeline(
             )
 
             # ---- Decode this clip ----
+            # Bring VAE back to GPU for decode (only if we offloaded it)
+            if _do_manual_offload:
+                self.vae.to(device)
+
             latents_for_decode = latents.unsqueeze(0)  # [1, C, T, H, W]
             if not (drop_first_motion and r == 0):
                 decode_latents = torch.cat([motion_latents, latents_for_decode], dim=2)
@@ -1341,6 +1380,9 @@ class Wan22S2VPipeline(
 
             clips.append(clip_video.cpu())
 
+            # Offload VAE back to CPU after decode + motion update
+            if _do_manual_offload:
+                self.vae.to("cpu")
             # Free VRAM between clips
             if current_omni_platform.is_available():
                 current_omni_platform.empty_cache()

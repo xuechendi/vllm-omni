@@ -165,12 +165,23 @@ class DiffusionEngine:
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
-        try:
-            self._dummy_run()
-        except Exception as e:
-            logger.error(f"Dummy run failed: {e}")
-            self.close()
-            raise e
+        _skip_warmup = os.environ.get("VLLM_DIFFUSION_SKIP_WARMUP", "0") == "1"
+        # S2V with cpu_offload: warmup's tiny input triggers edge-case crash.
+        # Skip warmup since real inference works correctly.
+        if not _skip_warmup and self.od_config.enable_cpu_offload:
+            supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
+            if supports_audio_input and supports_image_input:
+                _skip_warmup = True
+                logger.info("Skipping warmup for S2V with cpu_offload (known edge-case)")
+        if _skip_warmup:
+            logger.info("Skipping dummy warmup run")
+        else:
+            try:
+                self._dummy_run()
+            except Exception as e:
+                logger.error(f"Dummy run failed: {e}")
+                self.close()
+                raise e
 
     async def _check_and_start_background_loop(self):
         if self._closed:

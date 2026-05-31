@@ -1571,20 +1571,54 @@ class WanS2VTransformer3DModel(nn.Module):
         Returns:
             Predicted noise [B, C, T, H, W]
         """
+        import os
+
+        _mem_debug = os.environ.get("VLLM_S2V_MEM_DEBUG", "0") == "1"
+        _mem_dev = next(self.parameters()).device
+
+        def _log_mem(tag):
+            if not _mem_debug:
+                return
+            import torch
+
+            if _mem_dev.type == "xpu":
+                torch.xpu.synchronize(_mem_dev)
+                alloc = torch.xpu.memory_allocated(_mem_dev) / 1024**3
+                reserved = torch.xpu.memory_reserved(_mem_dev) / 1024**3
+                free = torch.xpu.mem_get_info(_mem_dev)[0] / 1024**3
+            else:
+                alloc = reserved = free = 0
+            msg = f"[MEM][{_mem_dev}] {tag:<45s} alloc={alloc:.2f}GB reserved={reserved:.2f}GB free={free:.2f}GB\n"
+            with open(f"/workspace/vllm-omni/s2v_mem_transformer_{_mem_dev.index or 0}.log", "a") as f:
+                f.write(msg)
+
         add_last_motion = self.add_last_motion * add_last_motion
 
-        # Audio embeddings (must be precomputed via encode_audio())
-        self.merged_audio_emb = encoder_hidden_states_audio["audio_emb"]
-        if self.enable_adain:
-            self.audio_emb_global = encoder_hidden_states_audio["audio_emb_global"]
+        # Audio embeddings — either precomputed dict with 'audio_emb' key,
+        # or raw input dict with 'audio_input'+'motion_frames' for on-the-fly encoding.
+        if "audio_emb" in encoder_hidden_states_audio:
+            self.merged_audio_emb = encoder_hidden_states_audio["audio_emb"]
+            if self.enable_adain:
+                self.audio_emb_global = encoder_hidden_states_audio["audio_emb_global"]
+        else:
+            audio_input = encoder_hidden_states_audio["audio_input"]
+            mf = encoder_hidden_states_audio["motion_frames"]
+            encoded = self.encode_audio(audio_input, mf)
+            self.merged_audio_emb = encoded["audio_emb"]
+            if self.enable_adain:
+                self.audio_emb_global = encoded["audio_emb_global"]
+
+        _log_mem("after audio emb setup")
 
         # Patch embedding + ref tokens + mask
         hidden_states, seq_lens, mask_input, post_patch_sizes = self.prepare_patch_embedding(
             hidden_states, ref_latents, cond_states
         )
+        _log_mem(f"after patch_embedding (seq={hidden_states.shape[1]})")
 
         # Precompute RoPE
         rotary_emb = self.prepare_rope(hidden_states, post_patch_sizes)
+        _log_mem("after prepare_rope")
 
         # Inject motion tokens
         hidden_states, seq_lens, rotary_emb, mask_input = self.inject_motion(
@@ -1596,6 +1630,7 @@ class WanS2VTransformer3DModel(nn.Module):
             drop_motion_frames=drop_motion_frames,
             add_last_motion=add_last_motion,
         )
+        _log_mem(f"after inject_motion (seq={hidden_states.shape[1]})")
 
         hidden_states = hidden_states + self.cond_type_embed(mask_input).to(hidden_states.dtype)
 
@@ -1606,6 +1641,7 @@ class WanS2VTransformer3DModel(nn.Module):
             timestep, encoder_hidden_states, hidden_states.dtype
         )
         temb, timestep_proj = self.timestep_proj_prepare(timestep_proj, temb, self.zero_timestep, self.original_seq_len)
+        _log_mem("after condition embeddings")
 
         # Transformer blocks
         kwargs = dict(
@@ -1619,6 +1655,10 @@ class WanS2VTransformer3DModel(nn.Module):
         for idx, block in enumerate(self.blocks):
             hidden_states = block(hidden_states, **kwargs)
             hidden_states = self.after_transformer_block(idx, hidden_states)
+            if _mem_debug and idx < 3:
+                _log_mem(f"after block[{idx}]")
+
+        _log_mem("after all blocks")
 
         # Output norm, projection & unpatchify
         hidden_states = hidden_states[:, : self.original_seq_len]

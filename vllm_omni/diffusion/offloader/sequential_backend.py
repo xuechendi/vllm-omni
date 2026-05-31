@@ -76,6 +76,9 @@ class SequentialOffloadHook(ModelHook):
         if param.device.type == "cpu":
             return
 
+        # Synchronize to ensure all pending GPU ops on this module complete
+        current_omni_platform.synchronize()
+
         # XPU's allocator doesn't respect stream dependencies in empty_cache,
         # so non-blocking copies can race with cache eviction. Use blocking
         # copies on XPU to avoid NULL pointer errors during DMA.
@@ -86,6 +89,8 @@ class SequentialOffloadHook(ModelHook):
             non_blocking=non_blocking,
             pin_memory=self.pin_memory,
         )
+        # Synchronize + empty_cache to fully release GPU memory
+        current_omni_platform.synchronize()
         current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
@@ -95,15 +100,47 @@ class SequentialOffloadHook(ModelHook):
         except StopIteration:
             return
 
+        # Synchronize and fully release fragmented memory before large allocation
+        current_omni_platform.synchronize()
+        current_omni_platform.empty_cache()
         self._move_params(module, self.device, non_blocking=False)
 
+    def _log_offload_mem(self, tag):
+        import os
+
+        if os.environ.get("VLLM_S2V_MEM_DEBUG", "0") != "1":
+            return
+        try:
+            import torch
+
+            if self.device.type == "xpu":
+                torch.xpu.synchronize(self.device)
+                alloc = torch.xpu.memory_allocated(self.device) / 1024**3
+                reserved = torch.xpu.memory_reserved(self.device) / 1024**3
+                free = torch.xpu.mem_get_info(self.device)[0] / 1024**3
+            else:
+                alloc = reserved = free = 0
+            msg = (
+                f"[OFFLOAD][{self.device}] {tag:<50s} alloc={alloc:.2f}GB reserved={reserved:.2f}GB free={free:.2f}GB\n"
+            )
+            with open(f"/workspace/vllm-omni/s2v_mem_offload_{self.device.index or 0}.log", "a") as f:
+                f.write(msg)
+        except Exception:
+            pass
+
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
+        self._log_offload_mem(f"pre_forward START ({module.__class__.__name__})")
+
         # Offload target modules to CPU
         for target in self.offload_targets:
+            self._log_offload_mem(f"  before _to_cpu({target.__class__.__name__})")
             self._to_cpu(target)
+            self._log_offload_mem(f"  after _to_cpu({target.__class__.__name__})")
 
         # Load current module to GPU
+        self._log_offload_mem(f"  before _to_gpu({module.__class__.__name__})")
         self._to_gpu(module)
+        self._log_offload_mem(f"  after _to_gpu({module.__class__.__name__})")
         current_omni_platform.synchronize()
 
         logger.debug(
