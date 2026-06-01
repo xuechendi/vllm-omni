@@ -5,6 +5,7 @@ from einops import rearrange, repeat
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -274,6 +275,97 @@ class RotaryEmbeddingWan(RotaryEmbedding):
             dim=-1,
         )
         return rotated.flatten(-2, -1).to(x.dtype)
+
+
+class RotaryEmbeddingWanS2V(RotaryEmbeddingWan):
+    """Rotary embedding for Wan S2V that accepts complex-valued precomputed freqs.
+
+    Converts complex freqs (from rope_precompute) to cos/sin and delegates
+    to RotaryEmbeddingWan for platform-optimized application.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(is_neox_style=False, half_head_dim=True)
+
+    def forward(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        freqs_sliced = freqs[:, : x.size(1)]
+        cos = freqs_sliced.real.float()
+        sin = freqs_sliced.imag.float()
+        return super().forward(x, cos, sin)
+
+
+class RotaryEmbeddingS2VGrid(torch.nn.Module):
+    """Grid-based RoPE for S2V motioner attention.
+
+    Applies complex-valued rotary embeddings using 3D grid sampling (frame, height, width).
+    Used by SimpleSelfAttention, SwinSelfAttention, CausalSelfAttention in motioner blocks.
+    """
+
+    @staticmethod
+    @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
+    def forward(x: torch.Tensor, grid_sizes, freqs: torch.Tensor, start=None) -> torch.Tensor:
+        n, c = x.size(2), x.size(3) // 2
+        input_dtype = x.dtype
+        device = x.device
+
+        trainable_freqs = None
+        if isinstance(freqs, list):
+            trainable_freqs = freqs[1]
+            freqs = freqs[0]
+        freqs = freqs.to(device)
+        freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+        output = x.clone()
+        seq_bucket = [0]
+        if not isinstance(grid_sizes, list):
+            grid_sizes = [grid_sizes]
+        for g in grid_sizes:
+            if not isinstance(g, list):
+                g = [torch.zeros_like(g), g]
+            batch_size = g[0].shape[0]
+            for i in range(batch_size):
+                if start is None:
+                    f_o, h_o, w_o = g[0][i]
+                else:
+                    f_o, h_o, w_o = start[i]
+
+                f, h, w = g[1][i]
+                t_f, t_h, t_w = g[2][i]
+                seq_f, seq_h, seq_w = f - f_o, h - h_o, w - w_o
+                seq_len = int(seq_f * seq_h * seq_w)
+                if seq_len > 0:
+                    if t_f > 0:
+                        seq_f_int = int(seq_f)
+                        seq_h_int = int(seq_h)
+                        seq_w_int = int(seq_w)
+
+                        if f_o >= 0:
+                            f_sam = torch.linspace(int(f_o), int(t_f + f_o) - 1, seq_f_int, device=device).long()
+                        else:
+                            f_sam = torch.linspace(int(-f_o), int(-t_f - f_o) + 1, seq_f_int, device=device).long()
+                        h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
+                        w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
+
+                        freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
+                        freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
+
+                        freqs_i = torch.cat(
+                            [
+                                freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                freqs[1][h_sam].view(1, seq_h_int, 1, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                freqs[2][w_sam].view(1, 1, seq_w_int, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                            ],
+                            dim=-1,
+                        ).reshape(seq_len, 1, -1)
+                    elif t_f < 0:
+                        freqs_i = trainable_freqs.unsqueeze(1)
+                    x_i = torch.view_as_complex(
+                        x[i, seq_bucket[-1] : seq_bucket[-1] + seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
+                    )
+                    x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+                    output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = x_i
+            seq_bucket.append(seq_bucket[-1] + seq_len)
+        return output.to(input_dtype)
 
 
 def apply_rope_to_qk(

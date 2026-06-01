@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+import os
 import queue
 import threading
 import time
@@ -96,9 +97,16 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
 
 
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
+    """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
+    from vllm_omni.platforms import current_omni_platform
+
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
         return int(getattr(model_cls, "dummy_run_num_frames"))
+    # XPU + S2V (audio+image input): warmup crashes due to XPU driver issue
+    # with cpu_offload model swap. Return 0 to skip warmup.
+    if current_omni_platform.is_xpu() and supports_audio_input:
+        return 0
     return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1
 
 
@@ -705,7 +713,17 @@ class DiffusionEngine:
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
-        num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+        # Determine num_frames for warmup. Configurable via od_config.warmup_num_frames
+        # or VLLM_DIFFUSION_WARMUP_NUM_FRAMES env var.
+        # num_frames=0 means skip warmup entirely.
+        num_frames = self.od_config.warmup_num_frames
+        if num_frames is None:
+            num_frames = int(os.environ.get("VLLM_DIFFUSION_WARMUP_NUM_FRAMES", "0"))
+        if num_frames <= 0:
+            num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+        if num_frames == 0:
+            logger.info("Skipping dummy warmup run (num_frames=0)")
+            return
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
@@ -875,7 +893,7 @@ class DiffusionEngine:
                 worker_thread.join(timeout=10)
             if worker_thread.is_alive():
                 logger.warning(
-                    "Worker thread did not terminate within 10s; scheduler and executor shutdown will be deferred."
+                    "Worker thread did not terminate within 10s; scheduler and executor shutdown will be skipped."
                 )
                 return
             else:

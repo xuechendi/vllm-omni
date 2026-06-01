@@ -929,21 +929,17 @@ class Wan22S2VPipeline(
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """Forward pass through the S2V transformer to predict noise.
 
-        The S2V model returns a list of tensors (one per batch element).
-        We take the first element since S2V processes one sample at a time.
+        With return_dict=False, the model returns (output,) where output is [B, C, T, H, W].
+        We squeeze batch dim since S2V processes one sample at a time.
         """
         if current_model is None:
             current_model = self.transformer
-        # WanModel_S2V's norm layers compute in float32; autocast ensures
-        # the float32→bfloat16 casts happen automatically (matching the
-        # original Wan2.2 inference path).
         param_dtype = next(current_model.parameters()).dtype
         with torch.amp.autocast(self.device.type, dtype=param_dtype):
             result = current_model(**kwargs)
-        # WanModel_S2V.forward returns a list of tensors
-        if isinstance(result, list):
-            return result[0]
-        return result[0] if isinstance(result, tuple) else result
+        if isinstance(result, tuple):
+            return result[0].squeeze(0)
+        return result.sample.squeeze(0)
 
     def diffuse(
         self,
@@ -988,40 +984,42 @@ class Wan22S2VPipeline(
             Denoised latents [C, T, H, W]
         """
         do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
+        attention_kwargs = {}
+        current_model = self.transformer
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for t in timesteps:
                 self._current_timestep = t
 
-                latent_model_input = [latents.to(device)]
+                latent_model_input = latents.to(device).unsqueeze(0)
                 timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)
 
-                # -- Positive (conditional) prediction kwargs --
                 positive_kwargs = {
-                    "x": latent_model_input,
-                    "t": timestep,
-                    "context": prompt_embeds[0:1],
-                    "seq_len": max_seq_len,
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": prompt_embeds[0:1],
+                    "encoder_hidden_states_audio": positive_audio_emb,
                     "cond_states": cond_latents,
                     "motion_latents": input_motion_latents,
                     "ref_latents": ref_latents,
-                    "motion_frames": motion_frames,
                     "drop_motion_frames": drop_first_motion,
-                    "audio_emb": positive_audio_emb,
+                    "attention_kwargs": attention_kwargs,
+                    "return_dict": False,
+                    "current_model": current_model,
                 }
-
                 if do_true_cfg:
                     negative_kwargs = {
-                        "x": latent_model_input,
-                        "t": timestep,
-                        "context": negative_prompt_embeds[0:1],
-                        "seq_len": max_seq_len,
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds[0:1],
+                        "encoder_hidden_states_audio": negative_audio_emb,
                         "cond_states": cond_latents,
                         "motion_latents": input_motion_latents,
                         "ref_latents": ref_latents,
-                        "motion_frames": motion_frames,
                         "drop_motion_frames": drop_first_motion,
-                        "audio_emb": negative_audio_emb,
+                        "attention_kwargs": attention_kwargs,
+                        "return_dict": False,
+                        "current_model": current_model,
                     }
                 else:
                     negative_kwargs = None
@@ -1131,6 +1129,10 @@ class Wan22S2VPipeline(
 
         device = self.device
         dtype = self.transformer.dtype if hasattr(self.transformer, "dtype") else torch.bfloat16
+
+        # Free fragmented memory from warmup/previous operations
+        if current_omni_platform.is_available():
+            current_omni_platform.empty_cache()
 
         if generator is None:
             generator = req.sampling_params.generator
@@ -1246,26 +1248,13 @@ class Wan22S2VPipeline(
             # Max sequence length for the transformer
             max_seq_len = int(np.prod([lat_target_frames, lat_h, lat_w]) // 4)
 
-            # -- Precompute audio embeddings once per clip --
+            # -- Audio embeddings --
+            # Pass raw audio to the transformer forward, which encodes it
+            # internally (after the offload hook moves it to GPU).
             mf = [motion_frames, lat_motion_frames]
-            # When CPU offload is active the transformer lives on CPU until
-            # its __call__ hook fires.  encode_audio() bypasses __call__,
-            # so move the audio sub-module to GPU explicitly.
-            _audio_enc = getattr(self.transformer, "casual_audio_encoder", None)
-            _audio_on_cpu = _audio_enc is not None and next(_audio_enc.parameters()).device.type == "cpu"
-            if _audio_on_cpu:
-                _audio_enc.to(device)
-            param_dtype = next(self.transformer.parameters()).dtype
-            with torch.amp.autocast(device.type, dtype=param_dtype):
-                positive_audio_emb = self.transformer.encode_audio(audio_input, mf)
             do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
-            if do_true_cfg:
-                with torch.amp.autocast(device.type, dtype=param_dtype):
-                    negative_audio_emb = self.transformer.encode_audio(0.0 * audio_input, mf)
-            else:
-                negative_audio_emb = None
-            if _audio_on_cpu:
-                _audio_enc.to("cpu")
+            positive_audio_emb = {"audio_input": audio_input, "motion_frames": mf}
+            negative_audio_emb = {"audio_input": 0.0 * audio_input, "motion_frames": mf} if do_true_cfg else None
 
             # -- Denoising loop --
             latents = self.diffuse(
@@ -1288,6 +1277,7 @@ class Wan22S2VPipeline(
             )
 
             # ---- Decode this clip ----
+
             latents_for_decode = latents.unsqueeze(0)  # [1, C, T, H, W]
             if not (drop_first_motion and r == 0):
                 decode_latents = torch.cat([motion_latents, latents_for_decode], dim=2)

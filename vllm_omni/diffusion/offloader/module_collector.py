@@ -49,6 +49,7 @@ class ModuleDiscovery:
         "text_encoder_3",
         "image_encoder",
         "mllm",
+        "audio_model",
     ]
     _FALLBACK_VAE_ATTRS = [
         "vae",

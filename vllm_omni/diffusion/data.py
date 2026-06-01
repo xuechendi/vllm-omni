@@ -495,6 +495,9 @@ class OmniDiffusionConfig:
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
+    # Warmup configuration
+    warmup_num_frames: int | None = None  # num_frames for dummy warmup run; auto-detected if None
+
     # Compilation
     enforce_eager: bool = False
 
