@@ -13,6 +13,19 @@ from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 logger = init_logger(__name__)
 
 
+def _probe_xpu_kernel(op_name: str) -> bool:
+    """Check if a specific XPU kernel op is available at runtime."""
+    try:
+        import vllm_xpu_kernels._C  # noqa: F401
+
+        return hasattr(torch.ops._C, op_name)
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
+has_xpu_apply_rotary_emb = _probe_xpu_kernel("apply_rotary_emb")
+
+
 class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     """XPU/Intel GPU implementation of OmniPlatform.
 

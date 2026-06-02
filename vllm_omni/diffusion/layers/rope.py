@@ -5,6 +5,7 @@ from einops import rearrange, repeat
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.platforms.xpu.platform import has_xpu_apply_rotary_emb
 
 logger = init_logger(__name__)
 
@@ -258,6 +259,18 @@ class RotaryEmbeddingWan(RotaryEmbedding):
             return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved, self.half_head_dim)
         else:
             return self.forward_native(x, cos, sin)
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        if has_xpu_apply_rotary_emb:
+            output = torch.empty_like(x)
+            torch.ops._C.apply_rotary_emb(output, x.contiguous(), cos, sin, self.is_neox_style)
+            return output
+        return self.forward_native(x, cos, sin)
 
     def forward_native(
         self,

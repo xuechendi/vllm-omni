@@ -121,7 +121,12 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        if torch.compiler.is_compiling():
+            return self.forward_native(x)
+        try:
+            return self._forward_fused(x)
+        except Exception:
+            return self.forward_native(x)
 
     def forward_native(
         self,

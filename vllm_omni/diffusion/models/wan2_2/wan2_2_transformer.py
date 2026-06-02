@@ -781,7 +781,7 @@ class WanTransformer3DModel(nn.Module):
         pos_embed_seq_len: Optional position embedding sequence length
     """
 
-    _repeated_blocks = ["WanTransformerBlock"]
+    _repeated_blocks = ["WanTransformerBlock", "AdaLayerNorm"]
     _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
