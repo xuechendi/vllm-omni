@@ -289,8 +289,8 @@ class RotaryEmbeddingWanS2V(RotaryEmbeddingWan):
 
     def forward(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         freqs_sliced = freqs[:, : x.size(1)]
-        cos = freqs_sliced.real.float()
-        sin = freqs_sliced.imag.float()
+        cos = freqs_sliced.real.to(x.dtype)
+        sin = freqs_sliced.imag.to(x.dtype)
         return super().forward(x, cos, sin)
 
 

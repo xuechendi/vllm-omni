@@ -718,10 +718,15 @@ class DiffusionEngine:
         # num_frames=0 means skip warmup entirely.
         num_frames = self.od_config.warmup_num_frames
         if num_frames is None:
-            num_frames = int(os.environ.get("VLLM_DIFFUSION_WARMUP_NUM_FRAMES", "0"))
+            env_val = os.environ.get("VLLM_DIFFUSION_WARMUP_NUM_FRAMES")
+            if env_val is not None:
+                num_frames = int(env_val)
+                if num_frames <= 0:
+                    logger.info("Skipping dummy warmup run (VLLM_DIFFUSION_WARMUP_NUM_FRAMES=%s)", env_val)
+                    return
+            else:
+                num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
         if num_frames <= 0:
-            num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
-        if num_frames == 0:
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
         req = OmniDiffusionRequest(
