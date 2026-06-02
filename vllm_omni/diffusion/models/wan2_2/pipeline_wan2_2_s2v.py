@@ -1277,6 +1277,9 @@ class Wan22S2VPipeline(
             )
 
             # ---- Decode this clip ----
+            if self.od_config.enable_cpu_offload:
+                self.transformer.to("cpu")
+                current_omni_platform.empty_cache()
 
             latents_for_decode = latents.unsqueeze(0)  # [1, C, T, H, W]
             if not (drop_first_motion and r == 0):
