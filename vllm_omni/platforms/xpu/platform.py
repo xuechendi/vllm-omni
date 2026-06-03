@@ -26,6 +26,18 @@ def _probe_xpu_kernel(op_name: str) -> bool:
 has_xpu_apply_rotary_emb = _probe_xpu_kernel("apply_rotary_emb")
 
 
+def _has_rotary_wrapper() -> bool:
+    try:
+        from vllm_xpu_kernels.rotary import apply_rotary_emb  # noqa: F401
+
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
+has_xpu_rotary_wrapper = has_xpu_apply_rotary_emb and _has_rotary_wrapper()
+
+
 class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     """XPU/Intel GPU implementation of OmniPlatform.
 

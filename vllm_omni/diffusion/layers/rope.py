@@ -5,7 +5,7 @@ from einops import rearrange, repeat
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
-from vllm_omni.platforms.xpu.platform import has_xpu_apply_rotary_emb
+from vllm_omni.platforms.xpu.platform import has_xpu_rotary_wrapper
 
 logger = init_logger(__name__)
 
@@ -172,6 +172,10 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
+        if has_xpu_rotary_wrapper:
+            from vllm_xpu_kernels.rotary import apply_rotary_emb
+
+            return apply_rotary_emb(x, cos, sin, is_neox=self.is_neox_style)
         return self.forward_native(x, cos, sin)
 
     def forward_musa(
@@ -266,10 +270,10 @@ class RotaryEmbeddingWan(RotaryEmbedding):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if has_xpu_apply_rotary_emb:
-            output = torch.empty_like(x)
-            torch.ops._C.apply_rotary_emb(output, x.contiguous(), cos, sin, self.is_neox_style)
-            return output
+        if has_xpu_rotary_wrapper:
+            from vllm_xpu_kernels.rotary import apply_rotary_emb
+
+            return apply_rotary_emb(x, cos, sin, is_neox=self.is_neox_style)
         return self.forward_native(x, cos, sin)
 
     def forward_native(
