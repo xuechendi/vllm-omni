@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import GeluAndMul
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -117,12 +118,15 @@ class SDXLResnetBlock2D(nn.Module):
 class SDXLGEGLU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__()
+        # Weights are swapped at load time so that the first half is the gate
+        # and the second half is the linear pass-through, matching GeluAndMul
+        # convention: output = gelu(first_half) * second_half.
         self.proj = ColumnParallelLinear(dim_in, dim_out * 2, bias=True)
+        self.act = GeluAndMul(approximate="none")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states, _ = self.proj(hidden_states)
-        hidden_states, gate = hidden_states.chunk(2, dim=-1)
-        return hidden_states * F.gelu(gate)
+        return self.act(hidden_states)
 
 
 class SDXLFeedForward(nn.Module):
@@ -833,6 +837,10 @@ class SDXLUNet2DConditionModel(nn.Module):
             # Handle GEGLU: diffusers stores as ff.net.0.proj.weight/bias
             if ".ff.net.0.proj." in name:
                 name = name.replace(".ff.net.0.proj.", ".ff.geglu.proj.")
+                # Swap halves for GeluAndMul: original layout is [hidden, gate],
+                # GeluAndMul expects [gate, hidden] (applies gelu to first half).
+                d = loaded_weight.shape[0] // 2
+                loaded_weight = torch.cat([loaded_weight[d:], loaded_weight[:d]], dim=0)
             elif ".ff.net.2." in name:
                 name = name.replace(".ff.net.2.", ".ff.out_proj.")
 
