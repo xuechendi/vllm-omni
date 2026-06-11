@@ -34,6 +34,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -167,7 +168,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
-            if current_omni_platform.supports_torch_inductor():
+            if isinstance(self.offload_backend, LayerWiseOffloadBackend):
+                logger.info("Model runner: Skipping torch.compile (incompatible with layer-wise offloading).")
+            elif current_omni_platform.supports_torch_inductor():
                 self._compile_transformer("transformer")
                 self._compile_transformer("transformer_2")
             else:
