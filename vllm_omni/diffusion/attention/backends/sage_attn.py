@@ -20,25 +20,39 @@ assert _SAGE_ATTN_TENSOR_LAYOUT in ("NHD", "HND"), (
     f"SAGE_ATTN_TENSOR_LAYOUT must be 'NHD' or 'HND', got '{_SAGE_ATTN_TENSOR_LAYOUT}'"
 )
 
+_SAGE_ATTN_PRECISION = os.environ.get("SAGE_ATTN_PRECISION", "auto").lower()
+
+_xpu_kernel_provider: str | None = None
+
 if current_omni_platform.is_xpu():
     try:
-        import inspect
-
-        from auto_round_kernel import ARK
-
-        _ark = ARK()
-        xpu_sageattn = _ark.sagev1
-        _sagev1_params = inspect.signature(xpu_sageattn).parameters
-        _sagev1_has_tensor_layout = "tensor_layout" in _sagev1_params
-        _sagev1_scale_param = "sm_scale" if "sm_scale" in _sagev1_params else "scale"
+        from deepklox.sageattn_interface import sageattn as xpu_sageattn
+        _xpu_kernel_provider = "deepklox"
+        logger.info("XPU SageAttention: using deepklox kernel.")
     except ImportError:
-        logger.warning(
-            "XPU SageAttention (auto_round_kernel.ARK.sagev1) is not available. "
-            "Install auto-round-lib for XPU sage attention support."
-        )
         xpu_sageattn = None
-        _sagev1_has_tensor_layout = False
-        _sagev1_scale_param = "scale"
+
+    if _xpu_kernel_provider is None:
+        try:
+            import inspect
+
+            from auto_round_kernel import ARK
+
+            _ark = ARK()
+            xpu_sageattn = _ark.sagev1
+            _xpu_kernel_provider = "ark"
+            _sagev1_params = inspect.signature(xpu_sageattn).parameters
+            _sagev1_has_tensor_layout = "tensor_layout" in _sagev1_params
+            _sagev1_scale_param = "sm_scale" if "sm_scale" in _sagev1_params else "scale"
+            logger.info("XPU SageAttention: using auto_round_kernel ARK.sagev1.")
+        except ImportError:
+            logger.warning(
+                "XPU SageAttention: no kernel available. "
+                "Install deepklox or auto-round-lib for XPU sage attention support."
+            )
+            xpu_sageattn = None
+            _sagev1_has_tensor_layout = False
+            _sagev1_scale_param = "scale"
 else:
     try:
         from sageattention import sageattn
@@ -109,8 +123,22 @@ class SageAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        if xpu_sageattn is None:
-            raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
+        assert xpu_sageattn is not None, (
+            "XPU SageAttention: no kernel available. "
+            "Install deepklox or auto-round-lib."
+        )
+
+        if _xpu_kernel_provider == "deepklox":
+            return xpu_sageattn(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                tensor_layout="NHD",
+                is_causal=self.causal,
+                sm_scale=self.softmax_scale,
+                precision=_SAGE_ATTN_PRECISION,
+            )
+
         orig_dtype = query.dtype
         q = query.to(torch.float16) if orig_dtype != torch.float16 else query
         k = key.to(torch.float16) if orig_dtype != torch.float16 else key
