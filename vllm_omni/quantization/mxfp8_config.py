@@ -12,6 +12,13 @@ Architecture:
       NPUMxfp8OnlineLinearMethod  – NPU online: _LazyWeightMixin for create_weights,
                                      overrides process_weights to quantize BF16 → FP8.
 
+XPU takes a different route: rather than reimplementing the ops, it reuses vLLM's
+online MXFP8 methods (which dispatch to XPUMxFp8LinearKernel / XPUExpertsMxFp8),
+adding only the diffusion-specific 3-D activation reshape:
+
+  VllmMxfp8OnlineLinearMethod    – FlattenActivationMixin over vLLM Mxfp8OnlineLinearMethod
+  VllmMxfp8OnlineMoEMethod       – vLLM Mxfp8OnlineMoEMethod, re-exported unchanged
+
 Extending to a new platform (e.g. CUDA MXFP8 once the ops are available):
 
     class CUDAMxfp8LinearMethod(MXFPLinearMethodBase):
@@ -39,6 +46,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.nn import Module
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import (
+    RoutedExperts,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -55,12 +66,44 @@ from vllm.model_executor.model_loader.reload.meta import (
 )
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import ModelWeightParameter
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization._copy_missing_attrs import (
     copy_missing_attrs as _copy_missing_attrs,
 )
+
+# ---------------------------------------------------------------------------
+# Compat shims for symbols vLLM moved between releases
+# ---------------------------------------------------------------------------
+
+try:
+    from vllm.model_executor.model_loader.reload.meta import CopyCounter
+except ImportError:
+    from vllm.model_executor.layers.quantization.fp8 import (  # type: ignore[attr-defined,no-redef]
+        CopyNumelCounter as CopyCounter,
+    )
+
+
+def copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
+    new_attrs = set(dir(new))
+    set_weight_attrs(new, {attr: getattr(old, attr) for attr in dir(old) if attr not in new_attrs})
+
+
+class FlattenActivationMixin:
+    """Flatten rank > 2 activations to ``(M, K)`` around the wrapped ``apply``.
+
+    vLLM's linear methods expect 2-D ``(num_tokens, hidden)`` activations.
+    Diffusion transformers pass ``(batch, seq, hidden)``. Put this first in
+    the MRO so ``super().apply`` resolves to the vLLM implementation.
+    """
+
+    def apply(self, layer, x, bias=None):
+        if x.dim() <= 2:
+            return super().apply(layer, x, bias)
+        ori_shape = x.shape
+        output = super().apply(layer, x.reshape(-1, ori_shape[-1]), bias)
+        return output.reshape(*ori_shape[:-1], -1)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -122,6 +165,12 @@ class DiffusionMXFP8Config(QuantizationConfig):
             ignored_layers=ignored_layers,
         )
 
+    _XPU_OFFLINE_UNSUPPORTED = (
+        "Native MXFP8 offline mode is not supported on XPU. "
+        "Use AutoRound MXFP8 checkpoints (quant_method='auto-round', data_type='mx_fp') instead, "
+        "or use online MXFP8 mode without is_checkpoint_mxfp8_serialized."
+    )
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -140,16 +189,26 @@ class DiffusionMXFP8Config(QuantizationConfig):
                 return NPUMxfp8OnlineLinearMethod(self)
             if current_omni_platform.is_xpu():
                 if self.is_checkpoint_mxfp8_serialized:
-                    raise NotImplementedError(
-                        "Native MXFP8 offline mode is not supported on XPU. "
-                        "Use AutoRound MXFP8 checkpoints (quant_method='auto-round', data_type='mx_fp') instead, "
-                        "or use online MXFP8 mode without is_checkpoint_mxfp8_serialized."
-                    )
+                    raise NotImplementedError(self._XPU_OFFLINE_UNSUPPORTED)
                 return VllmMxfp8OnlineLinearMethod()
             raise NotImplementedError(
                 "DiffusionMXFP8Config (W8A8 MXFP8) is currently only supported "
                 "on NPU (Ascend) and XPU (Intel) platforms."
             )
+        if isinstance(layer, RoutedExperts):
+            if is_layer_skipped(
+                prefix=prefix,
+                ignored_layers=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            if current_omni_platform.is_xpu():
+                if self.is_checkpoint_mxfp8_serialized:
+                    raise NotImplementedError(self._XPU_OFFLINE_UNSUPPORTED)
+                return VllmMxfp8OnlineMoEMethod(layer=layer)
+            # NPU has no MXFP8 MoE op yet; leave the experts in BF16 rather
+            # than failing the whole model load.
+            return None
         return None
 
 
@@ -195,12 +254,12 @@ class _LazyWeightMixin:
                     output_dim=0,
                     weight_loader=patched_weight_loader,
                 )
-                _copy_missing_attrs(layer.weight, weight)
+                copy_missing_attrs(layer.weight, weight)
                 layer.register_parameter("weight", weight)
                 del layer._load_device
 
             param = layer.weight
-            counter = CopyNumelCounter()
+            counter = CopyCounter()
             with counter:
                 res = weight_loader(param, loaded_weight, *args, **kwargs)
             layer._loaded_numel += counter.copied_numel
@@ -448,7 +507,7 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
                 output_dim=0,
                 weight_loader=layer.weight.weight_loader,
             )
-            _copy_missing_attrs(layer.weight, weight)
+            copy_missing_attrs(layer.weight, weight)
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
@@ -467,12 +526,16 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
 # ---------------------------------------------------------------------------
 # vLLM kernel-based methods (XPU, CUDA, ROCm — any platform with Mxfp8LinearKernel)
 # ---------------------------------------------------------------------------
-# Note: VllmMxfp8OfflineLinearMethod removed - XPU only supports AutoRound MXFP8 offline
-#       (see IncMxfp8OfflineLinearMethod in inc_config.py)
 
 try:
+    from vllm.model_executor.layers.quantization.inc.inc_linear import (
+        INCLinearMethod as _VllmINCLinearMethod,
+    )
     from vllm.model_executor.layers.quantization.online.mxfp8 import (
         Mxfp8OnlineLinearMethod as _VllmMxfp8OnlineBase,
+    )
+    from vllm.model_executor.layers.quantization.online.mxfp8 import (
+        Mxfp8OnlineMoEMethod as VllmMxfp8OnlineMoEMethod,
     )
 except ImportError as e:
     raise ImportError(
@@ -482,44 +545,34 @@ except ImportError as e:
     ) from e
 
 
-class VllmMxfp8OnlineLinearMethod(_VllmMxfp8OnlineBase):
-    """Online MXFP8 linear method extending vLLM's implementation with 3D tensor support.
+class VllmMxfp8OnlineLinearMethod(FlattenActivationMixin, _VllmMxfp8OnlineBase):
+    """vLLM's online MXFP8 linear method plus diffusion 3-D activation support.
 
-    Loads BF16 weights, quantizes to MXFP8 at load time using vLLM's kernel.
-    Adds reshape logic to handle 3D tensors from diffusion models.
-
-    Inherits from vLLM's Mxfp8OnlineLinearMethod and only overrides __init__ and apply().
-    __init__ directly initializes the kernel without calling super().__init__() to avoid
-    vLLM config dependency in unit tests. All other methods (create_weights,
-    process_weights_after_loading) are inherited directly from vLLM.
+    Loads BF16 weights and quantizes them to MXFP8 at load time; the GEMM runs
+    through whichever Mxfp8LinearKernel the platform selects (XPUMxFp8LinearKernel
+    on Intel GPUs). create_weights / process_weights_after_loading are inherited
+    unchanged, so kernel and layout fixes in vLLM apply here automatically.
     """
 
     def __init__(self) -> None:
-        """Initialize kernel directly without calling parent __init__ to avoid config dependency.
+        try:
+            super().__init__()
+        except AssertionError:
+            # vLLM's online FP8 base reads the ambient VllmConfig for
+            # `input_dtype`, which the MXFP8 path never consumes. Diffusers
+            # components (and unit tests) construct quant methods outside a
+            # set_current_vllm_config() context, so fall back to just the
+            # pieces MXFP8 needs.
+            from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 
-        TODO: skipping super().__init__() couples this to vLLM internals. If the parent
-        adds required initialization, consider a version-aware assertion or calling
-        super().__init__() with a fallback config.
-        """
-        from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+            self.out_dtype = self.input_dtype = torch.get_default_dtype()
+            self.kernel = init_mxfp8_linear_kernel()
 
-        self.kernel = init_mxfp8_linear_kernel()
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Apply with 3D tensor support for diffusion models.
+class VllmMxfp8OfflineLinearMethod(FlattenActivationMixin, _VllmINCLinearMethod):
+    """vLLM's INC MXFP8 linear method plus diffusion 3-D activation support.
 
-        vLLM's kernel expects 2D tensors (M, K), but diffusion models pass
-        3D tensors (batch, seq, hidden). Flatten before kernel, reshape after.
-        """
-        ori_shape = x.shape
-        if x.dim() > 2:
-            x = x.reshape(-1, ori_shape[-1])
-        output = super().apply(layer, x, bias)
-        if len(ori_shape) > 2:
-            output = output.reshape(*ori_shape[:-1], -1)
-        return output
+    Used for AutoRound MXFP8 offline checkpoints (data_type="mx_fp"). Weight/scale
+    handling lives in vLLM's ``INCMxfp8LinearScheme`` / ``XPUMxFp8LinearKernel``.
+    This subclass only flattens ``(batch, seq, hidden)`` activations to ``(M, K)``.
+    """
