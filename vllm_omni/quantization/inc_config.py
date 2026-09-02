@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Extended INC/AutoRound config for multi-stage omni models."""
 
 from __future__ import annotations
@@ -7,10 +7,11 @@ from __future__ import annotations
 from os.path import commonprefix
 from typing import TYPE_CHECKING, Any
 
-import torch
 from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
 from vllm.model_executor.models.utils import WeightsMapper
+
+from vllm_omni.quantization.mxfp8_config import VllmMxfp8OfflineLinearMethod
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -47,31 +48,53 @@ def _map_with_stage_prefix(
 
 
 class OmniINCConfig(INCConfig):
-    """INCConfig extended with multi-stage prefix remapping and MXFP8 support.
+    """INCConfig extended with multi-stage prefix remapping.
 
-    AutoRound MXFP8/MXFP4 checkpoints declare quant_method="auto-round" with
-    data_type="mx_fp"; they are served by vLLM's own INC MX schemes.
+    Quantization itself is vLLM's: :class:`INCConfig` resolves an ``INCScheme``
+    per layer, covering AutoRound INT4/INT8, MXFP4 (linear + MoE) and MXFP8
+    (linear only, via ``INCMxfp8LinearScheme`` → ``XPUMxFp8LinearKernel``). The
+    only omni-specific delta is that diffusion transformers hand their linear
+    layers ``(batch, seq, hidden)`` activations, so MXFP8 linear methods are
+    wrapped in :class:`VllmMxfp8OfflineLinearMethod`.
 
     Architecture:
-      - AutoRound INT4/INT8 → standard INCConfig path (xpu_w4a16_quant_layer, etc.)
-      - AutoRound MXFP8/MXFP4 (data_type="mx_fp") → vLLM INC MX scheme, wrapped by
-        :class:`_MXFlattenedLinearMethod`
-      - Native MXFP8 (quant_method="mxfp8") → DiffusionMXFP8Config → NPUMxfp8LinearMethod (NPU only)
+      - AutoRound INT4/INT8 → vLLM INCWna16Scheme
+      - AutoRound MXFP4 (data_type="mx_fp", bits=4) → vLLM INCMxfp4Scheme
+      - AutoRound MXFP8 (data_type="mx_fp", bits=8) → vLLM INCMxfp8Scheme
+      - AutoRound NVFP4 (data_type="nv_fp") → vLLM CompressedTensorsW4A4Fp4
+      - Native MXFP8 (quant_method="mxfp8") → DiffusionMXFP8Config (see mxfp8_config.py)
     """
 
-    # Extend supported data types and formats to include MXFP8
-    SUPPORTED_DTYPES = {"int", "mx_fp"}
+    SUPPORTED_DTYPES = {"int", "mx_fp", "nv_fp"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq", "auto_round:llm_compressor"}
 
     # ------------------------------------------------------------------
-    # Core integration: called by vLLM's configure_quant_config()
+    # Quantization method selection and checkpoint name mapping
     # ------------------------------------------------------------------
 
     def get_quant_method(self, layer, prefix: str):
-        """vLLM's method, wrapped for diffusion's 3-D activations on MX linears."""
+        """Delegate to vLLM, adding 3-D activation support for MXFP8 linears."""
+        if self.data_type == "nv_fp":
+            from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+                CompressedTensorsW4A4Fp4,
+            )
+
+            layer_config = self.config_parser.resolve(layer, prefix)
+            if isinstance(layer, LinearBase):
+                if not layer_config.quantized:
+                    return UnquantizedLinearMethod()
+                scheme = CompressedTensorsW4A4Fp4()
+                layer.scheme = scheme
+                return CompressedTensorsLinearMethod(self)
+            return None
+
         method = super().get_quant_method(layer, prefix)
-        if self.is_mxfp and isinstance(method, INCLinearMethod):
-            return _MXFlattenedLinearMethod(method.scheme)
+        if self.is_mxfp8 and isinstance(method, INCLinearMethod):
+            return VllmMxfp8OfflineLinearMethod(method.scheme)
         return method
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
@@ -161,30 +184,3 @@ class OmniINCConfig(INCConfig):
         if isinstance(quant_config, INCConfig):
             return cls.from_inc_config(quant_config)
         return quant_config
-
-
-# ---------------------------------------------------------------------------
-# AutoRound MXFP8/MXFP4 checkpoints - vLLM's INC MX schemes, 3-D activations
-# ---------------------------------------------------------------------------
-
-
-class _MXFlattenedLinearMethod(INCLinearMethod):
-    """vLLM's INC MX linear method with diffusion activations flattened to 2-D.
-
-    The MX GEMMs behind the INC MXFP4/MXFP8 schemes (``fp4_gemm`` / ``fp8_gemm``
-    on XPU) only accept 2-D activations, while diffusion transformers run
-    (B, S, K) hidden states. Weight creation, layout and the GEMM stay vLLM's;
-    only the reshape is added.
-    """
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if x.dim() <= 2:
-            return super().apply(layer, x, bias)
-        ori_shape = x.shape
-        output = super().apply(layer, x.reshape(-1, ori_shape[-1]), bias)
-        return output.reshape(*ori_shape[:-1], -1)
