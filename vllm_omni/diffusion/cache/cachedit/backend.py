@@ -255,7 +255,18 @@ class CacheDiTBackend(CacheBackend):
         if custom_enabler is not None:
             logger.info("Using custom cache-dit enabler for model: %s", pipeline_name)
             self._refresh_funcs = [custom_enabler(pipeline, self.config)]
-            self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
+            # A custom enabler decides for itself which DiT modules it wraps, so
+            # discover the targets rather than assuming ``pipeline.transformer``:
+            # that attribute is None for a Wan2.2 MoE run with boundary_ratio
+            # pinned to 1.0 (low-noise expert only), and it also misses
+            # ``transformer_2`` in the normal dual-expert case, leaving the second
+            # expert's hooks installed after ``disable()``.  ``is_cached`` keeps
+            # enablers that intentionally wrap a subset out of the target list.
+            self._cache_targets = [
+                transformer
+                for transformer in (attrgetter(name)(pipeline) for name in _dit_module_names(pipeline))
+                if BlockAdapter.is_cached(transformer)
+            ]
         else:
             for name in _dit_module_names(pipeline):
                 get_transformer = _make_pipeline_transformer_getter(name)
