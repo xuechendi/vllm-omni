@@ -15,10 +15,18 @@ language-model KV cache storage and defaults to `"auto"`. Diffusion FA
 quantization uses the dedicated diffusion flags so omni serve does not inherit
 that default.
 
-In vLLM-Omni diffusion pipelines, this is a runtime FA path: Q/K/V tensors are
-dynamically quantized before the attention operator. It does not quantize model
-weights and is separate from [FP8 W8A8](fp8.md), [Int8 W8A8](int8.md), or
-pre-quantized checkpoint formats.
+In vLLM-Omni diffusion pipelines, this is a runtime FA path: attention
+activations are dynamically quantized before the attention operator. Which
+tensors are quantized, and at what granularity, is backend-specific — the NPU
+backend quantizes Q, K, and V with block scales, while the XPU backend uses
+per-tensor scales and covers either Q/K/V or only K/V depending on the device and
+kernel build (see [Hardware Support](#hardware-support)).
+It does not quantize model weights and is separate from [FP8 W8A8](fp8.md),
+[Int8 W8A8](int8.md), or pre-quantized checkpoint formats.
+
+Despite the name, there is no persistent KV cache here: diffusion recomputes
+Q/K/V every forward pass, so the flag quantizes activations rather than cache
+storage. It is named by analogy to the autoregressive flag only.
 
 If `diffusion_kv_cache_dtype` is not set, behavior is unchanged and attention
 runs in the native dtype.
@@ -28,15 +36,43 @@ runs in the native dtype.
 | Device | FP8 FA |
 |--------|--------|
 | Ascend NPU | ✅ |
+| Intel XPU | ✅ |
 | NVIDIA GPU | ❌ |
 | AMD ROCm | ❌ |
-| Intel XPU | ❌ |
 
 Legend: `✅` supported, `❌` unsupported.
 
-FP8 FA is currently implemented only for the NPU Flash Attention backend. Other
+FP8 FA is implemented for the NPU and XPU Flash Attention backends. Other
 backends do not support `diffusion_kv_cache_dtype="fp8"` for diffusion attention
 and fall back to native dtype execution.
+
+On NPU, `FLASH_ATTN` quantizes **Q, K, and V** to FP8 E4M3 with **block** scales
+(block size 128 for Q, 256 for K/V), after a Hadamard/QuaRot rotation of Q and K,
+and feeds `dequant_scale_{query,key,value}` to
+`npu_fused_infer_attention_score_v2`.
+
+On XPU, `FLASH_ATTN` uses **per-tensor** FP8 E4M3 with `{q,k,v}_descale` passed to
+`flash_attn_varlen_func`. Scales are derived online from each tensor's own amax,
+so no calibration step is required. Which tensors get quantized is decided at
+runtime, because it depends on the device and the installed kernel wheel:
+
+- **Full FP8** (Q, K and V): Q\*K and P\*V both run natively in FP8 — the q/k
+  descales fold into the softmax scale and the softmax output is packed to e4m3.
+  This is implemented only in the `xe_3` kernel, which the kernel library
+  dispatches for `is_xe3p_arch()` (CRI and NVL-P), and it additionally needs a
+  kernel wheel whose `flash_attn_varlen_func` accepts `q_descale`.
+- **K/V only** (Q stays native): the fallback. The kernel dequantizes K and V
+  per element inside the mainloop, so the GEMMs still run at native width and
+  FP8 saves memory traffic rather than math. This is the only mode the `xe_2`
+  kernel implements.
+
+vLLM-Omni requests full FP8 and downgrades permanently on the first call that
+proves the stack cannot serve it, logging which mode is in use. Expect a much
+smaller speedup in the K/V-only mode; measure against the unquantized baseline
+rather than assuming a gain.
+
+Ring attention is rejected for any FP8 FA configuration because ring kernels do
+not propagate descale factors; use Ulysses SP instead.
 
 ## Model Type Support
 
@@ -45,7 +81,8 @@ and fall back to native dtype execution.
 | Model | Scope | Status | Notes |
 |-------|-------|--------|-------|
 | Wan2.2 | Eligible DiT full-attention FA on Ascend NPU | Tested | Compare quality and latency against a BF16 baseline before production use |
-| Other diffusion models | Eligible DiT full-attention FA on Ascend NPU | Not tested | You can try `diffusion_kv_cache_dtype="fp8"`; tune `diffusion_kv_cache_skip_steps` and `diffusion_kv_cache_skip_layers` when higher precision is needed |
+| Wan2.2 | DiT self-attention FA on Intel XPU | Not tested | Cross-attention opts out via `Attention(disable_kv_quant=True)` — its text-encoder sequences are short, so FP8 buys no speedup and costs quality |
+| Other diffusion models | Eligible DiT full-attention FA on Ascend NPU or Intel XPU | Not tested | You can try `diffusion_kv_cache_dtype="fp8"`; tune `diffusion_kv_cache_skip_steps` and `diffusion_kv_cache_skip_layers` when higher precision is needed |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 

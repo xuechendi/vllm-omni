@@ -9,6 +9,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
+from vllm_omni.diffusion.attention.backends.utils.fa_fp8 import fp8_varlen_attn
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
     run_paged_piecewise_plan,
@@ -77,6 +78,9 @@ class FlashAttentionImpl(AttentionImpl):
     # ``Attention(disable_kv_quant=True)``.
     _supported_kv_cache_dtypes = {
         "npu": {"fp8"},
+        # XPU quantizes K/V to per-tensor FP8 and hands the kernel the matching
+        # {k,v}_descale; see forward_xpu and utils/fa_fp8.py.
+        "xpu": {"fp8"},
     }
 
     def __init__(
@@ -148,6 +152,8 @@ class FlashAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attention_mask: torch.Tensor,
+        *,
+        fp8_kv: bool = False,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             _index_first_axis,
@@ -174,19 +180,20 @@ class FlashAttentionImpl(AttentionImpl):
             max_length_q = query_length
             indices_q = None
 
-        out_unpad = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seq_lens_q,
-            cu_seqlens_k=cu_seq_lens_k,
-            max_seqlen_q=max_length_q,
-            max_seqlen_k=max_length_k,
-            **{
-                "causal": self.causal,
-                "softmax_scale": self.softmax_scale,
-            },
-        )
+        varlen_kwargs = {
+            "cu_seqlens_q": cu_seq_lens_q,
+            "cu_seqlens_k": cu_seq_lens_k,
+            "max_seqlen_q": max_length_q,
+            "max_seqlen_k": max_length_k,
+            "causal": self.causal,
+            "softmax_scale": self.softmax_scale,
+        }
+        if fp8_kv:
+            out_unpad = fp8_varlen_attn(
+                flash_attn_varlen_func, q, k, v, num_sequences=batch_size, **varlen_kwargs
+            )
+        else:
+            out_unpad = flash_attn_varlen_func(q, k, v, **varlen_kwargs)
         out_unpad = self._unwrap_flash_output(out_unpad)
         if indices_q is None:
             return out_unpad.reshape(batch_size, query_length, *out_unpad.shape[1:])
@@ -237,6 +244,8 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        *,
+        fp8_kv: bool = False,
     ) -> torch.Tensor:
         """Common wrapper for calling flash_attn_varlen_func for XPU and CUDA in vLLM.
 
@@ -259,17 +268,20 @@ class FlashAttentionImpl(AttentionImpl):
         key = key.flatten(0, 1)
         value = value.flatten(0, 1)
 
-        out = flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=q_len,
-            max_seqlen_k=k_len,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
-        )
+        varlen_kwargs = {
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "max_seqlen_q": q_len,
+            "max_seqlen_k": k_len,
+            "causal": self.causal,
+            "softmax_scale": self.softmax_scale,
+        }
+        if fp8_kv:
+            out = fp8_varlen_attn(
+                flash_attn_varlen_func, query, key, value, num_sequences=batch_size, **varlen_kwargs
+            )
+        else:
+            out = flash_attn_varlen_func(q=query, k=key, v=value, **varlen_kwargs)
         out = self._unwrap_flash_output(out)
         # (b s) h d -> b s h d
         return out.reshape(batch_size, q_len, *out.shape[1:])
@@ -488,6 +500,11 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        # ``kv_cache_dtype`` only reaches here when the Attention layer resolved
+        # --diffusion-kv-cache-dtype for this layer and step; the XPU kernel then
+        # takes per-tensor FP8 K/V with {k,v}_descale and leaves Q native.
+        kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata is not None else None
+        fp8_kv = kv_cache_dtype == "fp8"
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
@@ -495,12 +512,14 @@ class FlashAttentionImpl(AttentionImpl):
                 key,
                 value,
                 attention_mask,
+                fp8_kv=fp8_kv,
             )
 
         return self._forward_varlen_dense(
             query,
             key,
             value,
+            fp8_kv=fp8_kv,
         )
 
     def forward_npu(
