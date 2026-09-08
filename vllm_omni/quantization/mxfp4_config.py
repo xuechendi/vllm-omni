@@ -12,13 +12,6 @@ Architecture mirrors mxfp8_config.py:
     NPUMxfp4DualScaleLinearMethod         – NPU dual-scale offline (W4A4 MXFP4 DualScale)
       NPUMxfp4DualScaleOnlineLinearMethod – NPU dual-scale online (BF16 → FP4)
 
-XPU reuses vLLM's own MXFP4 method and adds only what diffusion needs on top.
-Offline AutoRound MXFP4 checkpoints never reach this file: they are served by
-vLLM's INC path (see inc_config.py).
-
-  VllmMxfp4OnlineLinearMethod           – vLLM Mxfp4OnlineLinearMethod plus lazy weight
-                                          materialization and the (B, S, K) reshape
-
 Quantization configs:
 
   DiffusionMXFP4Config            – single-scale online/offline (quant_method="mxfp4")
@@ -66,6 +59,7 @@ from torch.nn import Module
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearBase,
+    LinearMethodBase,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -211,12 +205,6 @@ class DiffusionMXFP4Config(QuantizationConfig):
             mxfp4_scale_alg=config.get("mxfp4_scale_alg", 0),
         )
 
-    _XPU_OFFLINE_UNSUPPORTED = (
-        "Native MXFP4 offline mode is not supported on XPU. "
-        "Use AutoRound MXFP4 checkpoints (quant_method='auto-round', data_type='mx_fp') instead, "
-        "or use online MXFP4 mode without is_checkpoint_mxfp4_serialized."
-    )
-
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -246,19 +234,9 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 if self.is_checkpoint_mxfp4_serialized:
                     raise NotImplementedError("Pre-quantized MXFP4 checkpoints are not yet supported on ROCm.")
                 return ROCmMxfp4OnlineLinearMethod(self)
-            if current_omni_platform.is_xpu():
-                if self.mxfp4_scale_alg != 0:
-                    raise NotImplementedError("MXFP4 UOS quantization is currently only supported on NPU (Ascend).")
-                if self.w4a8_fallback_steps or self.w4a8_fallback_layers:
-                    raise NotImplementedError(
-                        "MXFP4 W4A8 step/layer fallback is currently only supported on NPU (Ascend)."
-                    )
-                if self.is_checkpoint_mxfp4_serialized:
-                    raise NotImplementedError(self._XPU_OFFLINE_UNSUPPORTED)
-                return VllmMxfp4OnlineLinearMethod()
             raise NotImplementedError(
                 "DiffusionMXFP4Config (W4A4 MXFP4) is currently only supported "
-                "on NPU (Ascend), ROCm (AMD, gfx950) and XPU (Intel) platforms."
+                "on NPU (Ascend) and ROCm (AMD, gfx950) platforms."
             )
         return None
 
@@ -1073,49 +1051,96 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
 
 
 # ---------------------------------------------------------------------------
-# XPU method — vLLM's online MXFP4 method plus what diffusion needs on top
+# XPU method — built directly on XPUMxFp4LinearKernel
 #
-# Weight quantization, the e8m0 scale relayout and the fp4_gemm call are all
-# vLLM's (Mxfp4OnlineLinearMethod -> XPUMxFp4LinearKernel). Only the lazy weight
-# materialization and the (B, S, K) activation reshape are added here.
+# Same split as MXFP8: the kernel owns the packed-weight / e8m0-scale relayout
+# and the fp4_gemm call, so vLLM's INC method layer is not depended on.
 # ---------------------------------------------------------------------------
 
 try:
-    from vllm.model_executor.layers.quantization.online.mxfp4 import (
-        Mxfp4OnlineLinearMethod,
-    )
+    from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
+    from vllm.model_executor.kernels.linear.mxfp4.xpu import XPUMxFp4LinearKernel
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
+    from vllm.model_executor.parameter import GroupQuantScaleParameter
 except ImportError as e:
     raise ImportError(
         "vLLM MXFP4 support is not available. "
-        "MXFP4 quantization requires vLLM with Mxfp4OnlineLinearMethod support. "
+        "MXFP4 quantization requires vLLM with XPUMxFp4LinearKernel support. "
         "Please upgrade vLLM or use a compatible build."
     ) from e
 
+MXFP4_PACK_FACTOR = 2  # two E2M1 values per uint8
 
-class VllmMxfp4OnlineLinearMethod(_LazyWeightMixin, Mxfp4OnlineLinearMethod):
-    """Online MXFP4 linear method: BF16 checkpoint, quantized at load time.
 
-    create_weights comes from :class:`_LazyWeightMixin` (meta device, weights
-    materialized just-in-time); the BF16 -> MXFP4 quantization and the GEMM are
-    vLLM's.
+class VllmMxfp4OfflineLinearMethod(LinearMethodBase):
+    """Offline MXFP4 linear method for AutoRound checkpoints (data_type="mx_fp").
+
+    Weights arrive packed two E2M1 values per byte, with one uint8 e8m0 scale per
+    ``group_size`` input elements. Layout normalization and the GEMM are the
+    kernel's; activations are flattened to ``(M, K)`` for diffusion.
     """
 
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
+    def __init__(self, group_size: int = 32) -> None:
+        self.group_size = group_size
+        self.kernel = XPUMxFp4LinearKernel(MxFp4LinearLayerConfig(activation_quant_key=kMxfp4Dynamic))
 
-        if layer.weight.device == torch.device("meta"):
-            weight = ModelWeightParameter(
-                data=torch.empty_like(layer.weight, device=layer._load_device),
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        if input_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                f"MXFP4 requires input_size_per_partition ({input_size_per_partition}) "
+                f"to be divisible by {self.group_size}."
+            )
+
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        # Checkpoint key is weight_packed; renamed to weight before the kernel
+        # relayout, which views it as float4_e2m1fn_x2.
+        layer.register_parameter(
+            "weight_packed",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // MXFP4_PACK_FACTOR,
+                    dtype=torch.uint8,
+                ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=layer.weight.weight_loader,
-            )
-            _copy_missing_attrs(layer.weight, weight)
-            layer.register_parameter("weight", weight)
-            initialize_single_dummy_weight(layer.weight)
+                weight_loader=weight_loader,
+            ),
+        )
+        layer.register_parameter(
+            "weight_scale",
+            GroupQuantScaleParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // self.group_size,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
 
-        super().process_weights_after_loading(layer)
+    def process_weights_after_loading(self, layer: Module) -> None:
+        layer.weight = torch.nn.Parameter(layer.weight_packed.data, requires_grad=False)
+        del layer.weight_packed
+        self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -1123,9 +1148,8 @@ class VllmMxfp4OnlineLinearMethod(_LazyWeightMixin, Mxfp4OnlineLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Flatten the diffusion (B, S, K) hidden states the MX GEMMs reject."""
         if x.dim() <= 2:
-            return super().apply(layer, x, bias)
+            return self.kernel.apply_weights(layer, x, bias)
         ori_shape = x.shape
-        output = super().apply(layer, x.reshape(-1, ori_shape[-1]), bias)
+        output = self.kernel.apply_weights(layer, x.reshape(-1, ori_shape[-1]), bias)
         return output.reshape(*ori_shape[:-1], -1)
