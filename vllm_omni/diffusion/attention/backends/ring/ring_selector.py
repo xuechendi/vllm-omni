@@ -10,6 +10,7 @@ from functools import partial
 import torch
 
 from .ring_globals import (
+    HAS_KLOX_SAGE_V3,
     HAS_SAGE_ATTENTION,
     HAS_SPARSE_SAGE_ATTENTION,
 )
@@ -19,6 +20,7 @@ from .ring_kernels import (
     flash_attn_forward,
     flash_attn_forward_aiter,
     flashinfer_attn_forward,
+    klox_sage_v3_hybrid_forward,
     pytorch_attn_forward,
 )
 
@@ -35,6 +37,7 @@ class AttnType(Enum):
     FA3 = "fa3"
     FA4 = "fa4"
     FLASHINFER = "flashinfer"
+    SYCL_TLA = "sycl_tla"
     TORCH = "torch"
     SAGE_AUTO = "sage_auto"
     SAGE_FP16 = "sage_fp16"
@@ -42,6 +45,8 @@ class AttnType(Enum):
     SAGE_FP8 = "sage_fp8"
     SAGE_FP8_SM90 = "sage_fp8_sm90"
     SPARSE_SAGE = "sparse_sage"
+    # deepklox SageAttention V3 Hybrid on Intel CRI (Xe3P): MXFP4 QK^T + MXFP8 P/V.
+    KLOX_SAGE_V3_HYBRID = "klox_sage_v3_hybrid"
 
     @classmethod
     def from_string(cls, s: str):
@@ -87,6 +92,15 @@ def select_flash_attn_impl(
 
     elif impl_type == AttnType.TORCH:
         return pytorch_attn_forward
+
+    elif impl_type == AttnType.KLOX_SAGE_V3_HYBRID:
+        if not HAS_KLOX_SAGE_V3:
+            raise ImportError(
+                "deepklox SageAttention V3 Hybrid is not available! It needs a deepklox built on "
+                "CRI with DEEPKLOX_ENABLED_KERNELS=sageattn, XPU_BUILD_WITH_XE3P=1 and "
+                "DEEPKLOX_SAGEATTN_V3_HYBRID=1."
+            )
+        return klox_sage_v3_hybrid_forward
 
     elif impl_type == AttnType.SAGE_AUTO:
         if not HAS_SAGE_ATTENTION:

@@ -4,14 +4,37 @@
 # Adapted from https://github.com/feifeibear/long-context-attention
 
 
-import torch
+import os
 
+import torch
+from vllm.logger import init_logger
+
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_SYCL_TLA_RING_ATTN
+from vllm_omni.diffusion.attention.backends.ring.ring_kernels import sycl_tla_ring_attn_forward
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType, select_flash_attn_impl
 from vllm_omni.diffusion.attention.backends.ring.ring_utils import (
     ring_kv_block_valid_length,
     update_out_and_lse,
 )
 from vllm_omni.diffusion.distributed.comm import RingComm
+
+
+logger = init_logger(__name__)
+
+_RING_ATTN_TYPE_ENV = "VLLM_OMNI_RING_ATTN_TYPE"
+
+
+def _resolve_ring_options(
+    attn_type: AttnType | None,
+    sycl_tla_precision: str | None,
+) -> tuple[AttnType, str]:
+    if attn_type is None:
+        attn_type = AttnType.from_string(
+            os.environ.get(_RING_ATTN_TYPE_ENV, AttnType.FA.value)
+        )
+    if sycl_tla_precision is None:
+        sycl_tla_precision = "bf16"
+    return attn_type, sycl_tla_precision.lower()
 
 
 def ring_flash_attn_forward(
@@ -26,13 +49,21 @@ def ring_flash_attn_forward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
-    attn_type: AttnType = AttnType.FA,
+    attn_type: AttnType | None = None,
     attn_processor=None,
     joint_tensor_key=None,
     joint_tensor_value=None,
     joint_strategy="front",
     valid_kv_length: int | None = None,
+    sycl_tla_precision=None,
+    sycl_tla_scale_q=None,
+    sycl_tla_scale_k=None,
+    sycl_tla_scale_v=None,
+    valid_kv_lens=None,
 ):
+    attn_type, sycl_tla_precision = _resolve_ring_options(
+        attn_type, sycl_tla_precision
+    )
     # Validate causal + joint_strategy combination
     # When causal=True and joint_strategy="rear", the causal mask would incorrectly
     # prevent local query tokens from attending to joint key tokens (which are
@@ -60,6 +91,31 @@ def ring_flash_attn_forward(
             "Trimming a circulated K/V block shortens seqlen_k while seqlen_q keeps "
             "the padded length, and the causal diagonal is bottom-right aligned, so "
             "the mask would silently shift. Unpad before the ring, or use causal=False."
+        )
+
+    if attn_type == AttnType.SYCL_TLA:
+        if not HAS_SYCL_TLA_RING_ATTN or q.device.type != "xpu":
+            raise RuntimeError("SYCL/TLA IPC ring attention requires its extension and an XPU input")
+        logger.info_once("SYCL/TLA IPC ring attention is enabled with precision=%s.", sycl_tla_precision)
+        return sycl_tla_ring_attn_forward(
+            process_group=process_group,
+            q=q,
+            k=k,
+            v=v,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            joint_tensor_key=joint_tensor_key,
+            joint_tensor_value=joint_tensor_value,
+            joint_strategy=joint_strategy,
+            precision=sycl_tla_precision,
+            scale_q=sycl_tla_scale_q,
+            scale_k=sycl_tla_scale_k,
+            scale_v=sycl_tla_scale_v,
+            valid_kv_lens=valid_kv_lens,
         )
 
     comm = RingComm(process_group)
@@ -165,6 +221,11 @@ class RingFlashAttnFunc(torch.autograd.Function):
         joint_tensor_value=None,
         joint_strategy="front",
         valid_kv_length: int | None = None,
+        sycl_tla_precision="bf16",
+        sycl_tla_scale_q=None,
+        sycl_tla_scale_k=None,
+        sycl_tla_scale_v=None,
+        valid_kv_lens=None,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -192,6 +253,11 @@ class RingFlashAttnFunc(torch.autograd.Function):
             joint_tensor_value=joint_tensor_value,
             joint_strategy=joint_strategy,
             valid_kv_length=valid_kv_length,
+            sycl_tla_precision=sycl_tla_precision,
+            sycl_tla_scale_q=sycl_tla_scale_q,
+            sycl_tla_scale_k=sycl_tla_scale_k,
+            sycl_tla_scale_v=sycl_tla_scale_v,
+            valid_kv_lens=valid_kv_lens,
         )
         return out if not return_softmax else (out, softmax_lse, None)
 
@@ -207,7 +273,11 @@ def ring_flash_attn_qkvpacked_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
-    attn_type: AttnType = AttnType.FA,
+    attn_type: AttnType | None = None,
+    sycl_tla_precision=None,
+    sycl_tla_scale_q=None,
+    sycl_tla_scale_k=None,
+    sycl_tla_scale_v=None,
 ):
     return RingFlashAttnFunc.apply(
         qkv[:, :, 0],
@@ -228,6 +298,11 @@ def ring_flash_attn_qkvpacked_func(
         None,  # joint_tensor_value
         "front",  # joint_strategy
         None,  # valid_kv_length
+        sycl_tla_precision,
+        sycl_tla_scale_q,
+        sycl_tla_scale_k,
+        sycl_tla_scale_v,
+        None,  # valid_kv_lens
     )
 
 
@@ -243,7 +318,11 @@ def ring_flash_attn_kvpacked_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
-    attn_type: AttnType = AttnType.FA,
+    attn_type: AttnType | None = None,
+    sycl_tla_precision=None,
+    sycl_tla_scale_q=None,
+    sycl_tla_scale_k=None,
+    sycl_tla_scale_v=None,
 ):
     return RingFlashAttnFunc.apply(
         q,
@@ -264,6 +343,11 @@ def ring_flash_attn_kvpacked_func(
         None,  # joint_tensor_value
         "front",  # joint_strategy
         None,  # valid_kv_length
+        sycl_tla_precision,
+        sycl_tla_scale_q,
+        sycl_tla_scale_k,
+        sycl_tla_scale_v,
+        None,  # valid_kv_lens
     )
 
 
@@ -280,12 +364,17 @@ def ring_flash_attn_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
-    attn_type: AttnType = AttnType.FA,
+    attn_type: AttnType | None = None,
     attn_processor=None,
     joint_tensor_key=None,
     joint_tensor_value=None,
     joint_strategy="front",
     valid_kv_length: int | None = None,
+    sycl_tla_precision=None,
+    sycl_tla_scale_q=None,
+    sycl_tla_scale_k=None,
+    sycl_tla_scale_v=None,
+    valid_kv_lens=None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, None]:
     """Ring Attention forward pass using Flash Attention backend.
 
@@ -329,6 +418,17 @@ def ring_flash_attn_func(
             Defaults to "front".
         valid_kv_length (int | None): Length of the contiguous valid prefix in
             the global ring K/V sequence. Defaults to the full sequence.
+        sycl_tla_precision (str): SYCL/TLA transport and compute precision.
+            Use "bf16" or "fp8_pertensor". For "fp8_pertensor", the
+            SYCL/TLA interface quantizes BF16 inputs before IPC staging.
+        sycl_tla_scale_q (float | None): Q dequantization scale for an already
+            quantized E4M3 Q tensor.
+        sycl_tla_scale_k (float | None): K dequantization scale for an already
+            quantized E4M3 K tensor.
+        sycl_tla_scale_v (float | None): V dequantization scale for an already
+            quantized E4M3 V tensor.
+        valid_kv_lens (Sequence[int] | None): Valid K/V tokens in each ring
+            rank's right-padded block.
 
     Returns:
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]:
@@ -354,4 +454,9 @@ def ring_flash_attn_func(
         joint_tensor_value,
         joint_strategy,
         valid_kv_length,
+        sycl_tla_precision,
+        sycl_tla_scale_q,
+        sycl_tla_scale_k,
+        sycl_tla_scale_v,
+        valid_kv_lens,
     )

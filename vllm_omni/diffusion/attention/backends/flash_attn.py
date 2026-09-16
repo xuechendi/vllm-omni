@@ -12,7 +12,13 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
-from vllm_omni.diffusion.attention.backends.utils.fa_fp8 import fp8_varlen_attn
+from vllm_omni.diffusion.attention.backends.utils.fa_fp8 import (
+    SYCL_TLA_FP8_LABEL,
+    SYCL_TLA_MXFP8_LABEL,
+    fp8_varlen_attn,
+    sycl_tla_fp8_attn,
+    sycl_tla_mxfp8_attn,
+)
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
     run_paged_piecewise_plan,
@@ -234,7 +240,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         "npu": {"fp8", "mxfp8", "mxfp4"},
         # XPU quantizes K/V to per-tensor FP8 and hands the kernel the matching
         # {k,v}_descale; see forward_xpu and utils/fa_fp8.py.
-        "xpu": {"fp8"},
+        "xpu": {"fp8", SYCL_TLA_FP8_LABEL, SYCL_TLA_MXFP8_LABEL},
     }
 
     def __init__(
@@ -786,6 +792,23 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """XPU flash attention implementation."""
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata is not None else None
+        sycl_tla_impl = {
+            SYCL_TLA_FP8_LABEL: sycl_tla_fp8_attn,
+            SYCL_TLA_MXFP8_LABEL: sycl_tla_mxfp8_attn,
+        }.get(kv_cache_dtype)
+        if sycl_tla_impl is not None:
+            if attention_mask is not None and torch.any(~attention_mask):
+                raise ValueError(f"kv_cache_dtype='{kv_cache_dtype}' does not support padded attention masks")
+            return sycl_tla_impl(
+                query,
+                key,
+                value,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+            )
+
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
         )
@@ -797,11 +820,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
 
-        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         # ``kv_cache_dtype`` only reaches here when the Attention layer resolved
         # --diffusion-kv-cache-dtype for this layer and step; the XPU kernel then
         # takes per-tensor FP8 K/V with {k,v}_descale and leaves Q native.
-        kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata is not None else None
         fp8_kv = kv_cache_dtype == "fp8"
 
         if attention_mask is not None and torch.any(~attention_mask):

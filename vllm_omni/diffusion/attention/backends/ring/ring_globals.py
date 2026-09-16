@@ -124,3 +124,21 @@ try:
     HAS_NPU = True
 except (ImportError, ModuleNotFoundError):
     HAS_NPU = False
+
+try:
+    from ring_attn_interface_ipc_pull import ring_attn_ipc_forward  # noqa: F401
+
+    HAS_SYCL_TLA_RING_ATTN = True
+except (ImportError, ModuleNotFoundError):
+    HAS_SYCL_TLA_RING_ATTN = False
+
+# deepklox SageAttention V3 Hybrid (Intel CRI/Xe3P). Probed on the `_C` symbol,
+# not the module: the wheel gates each kernel individually, so a build without
+# DEEPKLOX_SAGEATTN_V3_HYBRID=1 still imports and only fails at the first call.
+HAS_KLOX_SAGE_V3 = False
+try:
+    from deepklox import _C as _deepklox_C
+
+    HAS_KLOX_SAGE_V3 = hasattr(_deepklox_C, "sageattn_v3_hybrid")
+except (ImportError, ModuleNotFoundError):
+    pass

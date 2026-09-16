@@ -10,6 +10,7 @@ import torch
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
+from vllm_omni.diffusion.attention.backends.ring.ring_attn_utils import select_xpu_ring_attn_kwargs
 from vllm_omni.diffusion.attention.backends.ring.ring_globals import (
     FA3_SUPPORTED_CUDA_MAJORS,
     HAS_AITER,
@@ -148,6 +149,24 @@ class RingParallelAttention:
         """Run the actual Ring Attention kernel."""
         if softmax_scale is None:
             softmax_scale = query.shape[-1] ** -0.5
+
+        if query.device.type == "xpu":
+            # The XPU block kernels (SYCL/TLA, deepklox Sage V3 Hybrid) and the
+            # arguments only they take are decided in one place; None means no XPU
+            # kernel applies, so the generic selection below still runs.
+            xpu_kwargs = select_xpu_ring_attn_kwargs(key, attn_metadata, self._sp_group)
+            if xpu_kwargs is not None:
+                from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
+
+                return ring_flash_attn_func(
+                    query,
+                    key,
+                    value,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    group=self._sp_group.ring_group,
+                    **xpu_kwargs,
+                )
 
         backend_pref = self.attn_backend_pref
         if backend_pref is not None:

@@ -19,7 +19,9 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_SYCL_TLA_RING_ATTN
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
+from vllm_omni.diffusion.attention.backends.utils.fa_fp8 import SYCL_TLA_FP8_LABEL
 from vllm_omni.diffusion.attention.capabilities import (
     ExecutionContext,
     ExecutionPathResult,
@@ -333,11 +335,18 @@ class Attention(nn.Module):
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if dtype and dtype != "float":
-            if ring_degree > 1:
+            ring_fp8_supported = (
+                ring_degree > 1
+                and dtype == SYCL_TLA_FP8_LABEL
+                and current_omni_platform.is_xpu()
+                and HAS_SYCL_TLA_RING_ATTN
+            )
+            if ring_degree > 1 and not ring_fp8_supported:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "
-                    "(ring_degree > 1). Ring kernels do not propagate quantization descale "
-                    "factors. Use Ulysses SP instead."
+                    "(ring_degree > 1), except fp8_sycl_tla with the SYCL/TLA XPU IPC backend. "
+                    "Other ring kernels do not propagate quantization descale factors. "
+                    "Use Ulysses SP instead."
                 )
             platform_key = current_omni_platform.device_name
             if not self.attention.supports_kv_cache_dtype(dtype, platform_key):

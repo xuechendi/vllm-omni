@@ -16,6 +16,7 @@ For the internal selector, registry, and platform contract, see
 | Need | Guide |
 | --- | --- |
 | Select a conservative or platform-native dense kernel | [Dense Backends](attention_backends/dense_backends.md) |
+| Build and use SYCL-TLA FP8 or MXFP8 FlashAttention on Intel XPU | [SYCL-TLA FP8 Attention](attention_backends/sycl_tla_attn.md) |
 | Use FlashInfer trtllm-gen FMHA, Skip-Softmax, or TRTLLM SAGE quantization | [TRTLLM Attention](attention_backends/trtllm.md) |
 | Install and use SageAttention 2.2 or SageAttention3 | [SageAttention](attention_backends/sage.md) |
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
@@ -28,7 +29,7 @@ For the internal selector, registry, and platform contract, see
 | Value | Family | Primary use | Detail |
 | --- | --- | --- | --- |
 | `TORCH_SDPA` | Dense | Conservative reference; always available | [Dense Backends](attention_backends/dense_backends.md#torch_sdpa) |
-| `FLASH_ATTN` | Dense | FlashAttention 4/3/2 depending on the installed package and GPU | [Dense Backends](attention_backends/dense_backends.md#flash_attn) |
+| `FLASH_ATTN` | Dense | FlashAttention 4/3/2 depending on the installed package and GPU; SYCL-TLA FP8/MXFP8 on XPU | [Dense Backends](attention_backends/dense_backends.md#flash_attn), [SYCL-TLA](attention_backends/sycl_tla_attn.md) |
 | `CUDNN_ATTN` | Dense | Mask-heavy DiTs on Blackwell with cuDNN 9.5 or newer | [Dense Backends](attention_backends/dense_backends.md#cudnn_attn) |
 | `FLASHINFER_ATTN` | Dense or quantized | FlashInfer batch prefill; optional mixed Q/K and V dtypes | [Dense Backends](attention_backends/dense_backends.md#flashinfer_attn) |
 | `TRTLLM_ATTN` | Dense, sparse, or quantized | Datacenter Blackwell with `head_dim=128` and compatible packed paths | [TRTLLM Attention](attention_backends/trtllm.md) |

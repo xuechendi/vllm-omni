@@ -8,9 +8,20 @@ import torch
 
 from vllm_omni.diffusion.attention.backends.ring import ring_kernels
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
+from vllm_omni.diffusion.attention.backends import ring_flash_attn
 from vllm_omni.diffusion.attention.parallel import ring as ring_parallel
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_sycl_tla_precision_defaults_to_bf16_without_metadata(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_RING_ATTN_PRECISION", "fp8_pertensor")
+
+    _, default_precision = ring_flash_attn._resolve_ring_options(AttnType.SYCL_TLA, None)
+    _, explicit_precision = ring_flash_attn._resolve_ring_options(AttnType.SYCL_TLA, "fp8_pertensor")
+
+    assert default_precision == "bf16"
+    assert explicit_precision == "fp8_pertensor"
 
 
 def test_fa4_wrapper_returns_lse_and_normalizes_unbounded_window(monkeypatch):

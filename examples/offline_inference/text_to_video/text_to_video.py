@@ -4,6 +4,7 @@
 import argparse
 import json
 import time
+import os
 from pathlib import Path
 from typing import Any
 
@@ -398,6 +399,25 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='Quantization JSON, e.g. \'{"method":"mxfp4","w4a8_fallback_steps":[0,2]}\'.',
     )
+    parser.add_argument(
+        "--diffusion-kv-cache-dtype",
+        type=str,
+        default=None,
+        help="Diffusion attention KV-cache dtype, including fp8_sycl_tla or mxfp8_sycl_tla on XPU. "
+        "Separate from transformer --quantization.",
+    )
+    parser.add_argument(
+        "--diffusion-kv-cache-skip-steps",
+        type=str,
+        default=None,
+        help="Diffusion KV-cache quantization skip-step selector, e.g. '0-9,20,25-30'.",
+    )
+    parser.add_argument(
+        "--diffusion-kv-cache-skip-layers",
+        type=str,
+        default=None,
+        help="Diffusion KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
+    )
 
     # Distributed and parallel execution
     parser.add_argument(
@@ -418,6 +438,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
+    )
+    parser.add_argument(
+        "--ring-attn-type",
+        type=str,
+        default=None,
+        choices=["fa", "sycl_tla"],
+        help="Ring attention backend. Use 'sycl_tla' for XPU IPC ring attention.",
     )
     parser.add_argument(
         "--cfg-parallel-size",
@@ -519,6 +546,9 @@ def main():
     resolved_model_class_name = model_class_name or resolve_model_class_name(args.model)
     video_defaults = get_video_generation_defaults(resolved_model_class_name, args.extra_body)
 
+    if args.ring_attn_type is not None:
+        os.environ["VLLM_OMNI_RING_ATTN_TYPE"] = args.ring_attn_type
+
     preset = _detect_preset(args.model, resolved_model_class_name, args.extra_body)
     for key, default_val in preset.items():
         if getattr(args, key.replace("-", "_"), None) is None:
@@ -570,6 +600,9 @@ def main():
         enable_distributed_layerwise_offload=args.enable_distributed_layerwise_offload,
         dlo_use_allgather=args.dlo_use_allgather,
         dlo_resident_layers=args.dlo_resident_layers,
+        diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
+        diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
+        diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
@@ -616,11 +649,18 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
+    print(f"  diffusion_kv_cache_skip_steps(config): {args.diffusion_kv_cache_skip_steps}")
+    print(f"  diffusion_kv_cache_skip_layers(config): {args.diffusion_kv_cache_skip_layers}")
     print(
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
         f" vae_patch_parallel_size={args.vae_patch_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size},"
         f" enable_expert_parallel={args.enable_expert_parallel}"
+    )
+    print(
+        "  Ring attention: "
+        f"type={args.ring_attn_type or 'fa'}, "
+        f"precision={'fp8_pertensor' if args.diffusion_kv_cache_dtype == 'fp8_sycl_tla' else 'bf16'}"
     )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")

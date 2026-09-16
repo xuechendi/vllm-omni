@@ -441,6 +441,7 @@ class SequenceParallelSplitHook(ModelHook):
         via `shard_group` to build masks. Legacy singleton padding fields are
         also populated for single-sequence models.
         """
+        from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_SYCL_TLA_RING_ATTN
         from vllm_omni.diffusion.attention.selector import get_attn_backend_for_capability
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_ring_parallel_world_size,
@@ -470,6 +471,9 @@ class SequenceParallelSplitHook(ModelHook):
             # Keyed groups record their length even when no padding is needed.
             return sp_shard(x, dim, validate=False)
 
+        ring_attention = get_ring_parallel_world_size() > 1
+        supports_padded_ring = ring_attention and x.device.type == "xpu" and HAS_SYCL_TLA_RING_ATTN
+
         # Check backend compatibility
         attention_config = None
         if is_forward_context_available():
@@ -484,7 +488,7 @@ class SequenceParallelSplitHook(ModelHook):
         attention_spec = None
         if attention_config is not None:
             attention_spec, _ = attention_config.resolve_with_source(role="self")
-        if not attn_backend.supports_attention_mask(attention_spec):
+        if not supports_padded_ring and not attn_backend.supports_attention_mask(attention_spec):
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
                 f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
@@ -492,11 +496,10 @@ class SequenceParallelSplitHook(ModelHook):
             )
 
         # Ring attention does not support attention_mask
-        if get_ring_parallel_world_size() > 1:
+        if ring_attention and not supports_padded_ring:
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
-                f"Cannot use Ring attention which does not support attention_mask. "
-                f"Please switch to Ulysses SP only."
+                "Padded Ring attention requires the SYCL/TLA XPU IPC backend with valid K/V lengths."
             )
 
         # Calculate padding

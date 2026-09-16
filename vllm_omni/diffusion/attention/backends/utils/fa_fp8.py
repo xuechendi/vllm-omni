@@ -45,13 +45,23 @@ the native dtype the pipeline expects back.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+SYCL_TLA_FP8_LABEL = "fp8_sycl_tla"
+SYCL_TLA_MXFP8_LABEL = "mxfp8_sycl_tla"
+
+_SYCL_TLA_HEAD_DIM = 128
+_MX_GROUP_SIZE = 32
+_UE8M0_BIAS = 127
+_MIN_AMAX = 1e-6
 
 # None until the first FP8 attention call resolves it; False latches permanently
 # so a stack without full-FP8 support pays the probe exactly once per process.
@@ -64,6 +74,179 @@ _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 # of headroom makes ``tensor / scale <= _FP8_MAX`` hold by construction, so no
 # clamp pass is needed (a clamp costs ~25% more than the division itself).
 _FP8_SCALE_HEADROOM = 1.0 + 2.0**-8
+
+
+@torch._dynamo.disable
+@lru_cache(maxsize=1)
+def _import_sycl_tla_fmha(label: str):
+    try:
+        import sycl_tla_fmha
+    except ImportError as exc:
+        raise ImportError(
+            f"kv_cache_dtype='{label}' requires the sycl_tla_fmha extension built from "
+            "cutlass-sycl examples/06_bmg_flash_attention. Put its build directory "
+            "on PYTHONPATH."
+        ) from exc
+    return sycl_tla_fmha
+
+
+@torch._dynamo.disable
+@lru_cache(maxsize=1)
+def _load_sycl_tla_fp8_func():
+    module = _import_sycl_tla_fmha(SYCL_TLA_FP8_LABEL)
+    return module.prefill_fp8_e4m3_bshd
+
+
+@torch._dynamo.disable
+@lru_cache(maxsize=1)
+def _load_sycl_tla_mxfp8_func():
+    module = _import_sycl_tla_fmha(SYCL_TLA_MXFP8_LABEL)
+    if not hasattr(module, "prefill_mxfp8_e4m3_bshd"):
+        raise ImportError(
+            f"kv_cache_dtype='{SYCL_TLA_MXFP8_LABEL}' requires a sycl_tla_fmha build "
+            f"that exports prefill_mxfp8_e4m3_bshd; rebuild the extension from {module.__file__}"
+        )
+    return module.prefill_mxfp8_e4m3_bshd
+
+
+def _abs_amax(tensor: torch.Tensor) -> torch.Tensor:
+    return torch.maximum(tensor.amax().abs(), tensor.amin().abs()).float()
+
+
+def _scale_to_fp8(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return (
+        tensor.to(torch.float32, copy=True)
+        .mul_(scale)
+        .clamp_(-_FP8_MAX, _FP8_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+
+def _validate_sycl_tla_inputs(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, label: str) -> int:
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError(f"kv_cache_dtype='{label}' requires BSHD Q/K/V tensors")
+    if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+        raise ValueError(f"kv_cache_dtype='{label}' requires matching Q/K/V batch sizes")
+    if key.shape[:3] != value.shape[:3]:
+        raise ValueError(f"kv_cache_dtype='{label}' requires matching K/V shapes")
+    head_dim = query.shape[-1]
+    if head_dim != _SYCL_TLA_HEAD_DIM or key.shape[-1] != head_dim or value.shape[-1] != head_dim:
+        raise ValueError(
+            f"kv_cache_dtype='{label}' only supports Q/K/V head_dim {_SYCL_TLA_HEAD_DIM}"
+        )
+    return head_dim
+
+
+def sycl_tla_fp8_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+) -> torch.Tensor:
+    """Run the dense BSHD SYCL-TLA FP8 E4M3 attention kernel."""
+    head_dim = _validate_sycl_tla_inputs(query, key, value, SYCL_TLA_FP8_LABEL)
+    prefill = _load_sycl_tla_fp8_func()
+    alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
+
+    q_amax = _abs_amax(query).clamp_(min=_MIN_AMAX)
+    k_amax = _abs_amax(key).clamp_(min=_MIN_AMAX)
+    v_amax = _abs_amax(value).clamp_(min=_MIN_AMAX)
+    q_scale = torch.sqrt(alpha * k_amax / q_amax)
+    v_scale = _FP8_MAX / v_amax
+
+    query_fp8 = _scale_to_fp8(query, q_scale)
+    key_fp8 = _scale_to_fp8(key, alpha / q_scale)
+    value_fp8 = _scale_to_fp8(value, v_scale)
+
+    torch.xpu.synchronize()
+    output = prefill(q=query_fp8, k=key_fp8, v=value_fp8, is_causal=causal)
+    return (output / v_scale).to(query.dtype)
+
+
+def _mx_exponent(blocked: torch.Tensor, reduce_dim: int) -> torch.Tensor:
+    amax = torch.maximum(blocked.amax(reduce_dim).abs(), blocked.amin(reduce_dim).abs()).float()
+    amax = amax.clamp_min(torch.finfo(torch.float32).tiny)
+    exponent = torch.ceil(torch.log2(amax / _FP8_MAX))
+    return exponent.clamp(-_UE8M0_BIAS, _UE8M0_BIAS)
+
+
+def _mx_apply(blocked: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
+    return (
+        blocked.to(torch.float32, copy=True)
+        .div_(torch.exp2(exponent))
+        .clamp_(-_FP8_MAX, _FP8_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+
+@torch._dynamo.disable
+def _mx_quantize(tensor: torch.Tensor, group_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """MX-quantize a BSHD tensor in 32-element groups."""
+    group_size = _MX_GROUP_SIZE
+    batch, seq_len, num_heads, head_dim = tensor.shape
+
+    if group_dim == 3:
+        if head_dim % group_size:
+            raise ValueError(f"head dim {head_dim} must be a multiple of {group_size}")
+        blocked = tensor.reshape(batch, seq_len, num_heads, head_dim // group_size, group_size)
+        exponent = _mx_exponent(blocked, -1)
+        values = _mx_apply(blocked, exponent.unsqueeze(-1)).reshape_as(tensor)
+        return values, (exponent + _UE8M0_BIAS).to(torch.uint8)
+
+    if group_dim != 1:
+        raise ValueError(f"unsupported group_dim {group_dim}")
+
+    full_len = (seq_len // group_size) * group_size
+    values = torch.empty(tensor.shape, dtype=torch.float8_e4m3fn, device=tensor.device)
+    exponent = None
+    if full_len:
+        blocked = tensor[:, :full_len].reshape(batch, full_len // group_size, group_size, num_heads, head_dim)
+        exponent = _mx_exponent(blocked, 2)
+        values[:, :full_len] = _mx_apply(blocked, exponent.unsqueeze(2)).reshape(
+            batch, full_len, num_heads, head_dim
+        )
+    if full_len < seq_len:
+        tail = tensor[:, full_len:].unsqueeze(1)
+        tail_exponent = _mx_exponent(tail, 2)
+        values[:, full_len:] = _mx_apply(tail, tail_exponent.unsqueeze(2)).reshape(
+            batch, seq_len - full_len, num_heads, head_dim
+        )
+        exponent = tail_exponent if exponent is None else torch.cat((exponent, tail_exponent), dim=1)
+    assert exponent is not None
+    return values, (exponent + _UE8M0_BIAS).to(torch.uint8)
+
+
+def sycl_tla_mxfp8_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+) -> torch.Tensor:
+    """Run the dense BSHD SYCL-TLA block-scaled MXFP8 attention kernel."""
+    head_dim = _validate_sycl_tla_inputs(query, key, value, SYCL_TLA_MXFP8_LABEL)
+    prefill = _load_sycl_tla_mxfp8_func()
+    alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
+    scaled_query = query if alpha == 1.0 else query * alpha
+
+    query_fp8, query_exp = _mx_quantize(scaled_query, 3)
+    key_fp8, key_exp = _mx_quantize(key, 3)
+    value_fp8, value_exp = _mx_quantize(value, 1)
+
+    torch.xpu.synchronize()
+    output = prefill(
+        q=query_fp8,
+        k=key_fp8,
+        v=value_fp8,
+        scale_q=query_exp.permute(0, 2, 3, 1).contiguous(),
+        scale_k=key_exp.permute(0, 2, 3, 1).contiguous(),
+        scale_v=value_exp.permute(0, 2, 1, 3).contiguous(),
+        is_causal=causal,
+    )
+    return output.to(query.dtype)
 
 
 def _quantize_per_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

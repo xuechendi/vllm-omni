@@ -12,15 +12,21 @@ from .ring_globals import (
     HAS_FA4,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
+    HAS_KLOX_SAGE_V3,
+    HAS_SYCL_TLA_RING_ATTN,
     fa3_fwd_func,
     fa4_attn_func,
 )
+
+if HAS_SYCL_TLA_RING_ATTN:
+    from ring_attn_interface_ipc_pull import ring_attn_ipc_forward
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
 _scaled_dot_product_efficient_attention = torch.ops.aten._scaled_dot_product_efficient_attention
 
 try:
     import torch_musa  # noqa: F401
+
 
     _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_attention_flash_musa
     _scaled_dot_product_efficient_attention = None
@@ -37,7 +43,134 @@ if HAS_FLASH_ATTN:
 if HAS_FLASHINFER:
     from flashinfer.prefill import single_prefill_with_kv_cache
 
-    _LOG2_E = math.log2(math.e)
+_LOG2_E = math.log2(math.e)
+
+
+def sycl_tla_ring_attn_forward(
+    process_group,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    joint_tensor_key=None,
+    joint_tensor_value=None,
+    joint_strategy="front",
+    valid_kv_lens=None,
+    precision="bf16",
+    scale_q=None,
+    scale_k=None,
+    scale_v=None,
+):
+    """Run the SYCL/TLA IPC ring kernel on Intel XPU."""
+    if not HAS_SYCL_TLA_RING_ATTN:
+        raise RuntimeError("SYCL/TLA IPC ring attention is not available")
+
+    return ring_attn_ipc_forward(
+        process_group=process_group,
+        q=q.contiguous(),
+        k=k.contiguous(),
+        v=v.contiguous(),
+        softmax_scale=softmax_scale,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        joint_tensor_key=joint_tensor_key,
+        joint_tensor_value=joint_tensor_value,
+        joint_strategy=joint_strategy,
+        return_softmax_lse=True,
+        valid_kv_lens=valid_kv_lens,
+        precision=precision,
+        scale_q=scale_q,
+        scale_k=scale_k,
+        scale_v=scale_v,
+    )
+
+
+def klox_sage_v3_hybrid_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=None,
+    alibi_slopes=None,
+    return_softmax=False,
+):
+    """deepklox SageAttention V3 Hybrid (MXFP4 E2M1 QK^T + MXFP8 E4M3 P/V) as a
+    Ring Attention block kernel, on Intel CRI (Xe3P).
+
+    q/k/v are (bs, seqlen, nhead, headdim), i.e. the kernel's NHD layout, which
+    it reads without a staging transpose.
+
+    Checked here: the arguments this signature accepts but the kernel cannot see
+    (it takes no dropout/window/softcap/alibi/scale), plus Sq == Skv, which has a
+    ring-specific cause worth naming. Everything the kernel does see -- device,
+    dtype, head_dim, MHA, B=1 -- it validates itself with a clear message. Under
+    pure ring on Wan2.2 all of them hold (D=128, MHA, non-causal, equal shards,
+    no joint K/V: cross-attention opts out of sequence parallelism).
+    """
+    del return_softmax  # the kernel returns (out, lse) only, never the probabilities
+    if not HAS_KLOX_SAGE_V3:
+        raise ImportError(
+            "deepklox SageAttention V3 Hybrid is not available. It needs a deepklox built on "
+            "CRI with DEEPKLOX_ENABLED_KERNELS=sageattn, XPU_BUILD_WITH_XE3P=1 and "
+            "DEEPKLOX_SAGEATTN_V3_HYBRID=1."
+        )
+    from deepklox.sageattn_interface import sageattn_v3_hybrid
+
+    if causal:
+        raise ValueError("sageattn_v3_hybrid is non-causal; ring attention with causal=True cannot use it")
+    if dropout_p:
+        raise ValueError("sageattn_v3_hybrid does not support dropout")
+    if window_size not in ((-1, -1), None):
+        raise ValueError(f"sageattn_v3_hybrid does not support a sliding window, got {window_size}")
+    if softcap:
+        raise ValueError("sageattn_v3_hybrid does not support softcap")
+    if alibi_slopes is not None:
+        raise ValueError("sageattn_v3_hybrid does not support alibi slopes")
+    if q.dim() != 4:
+        raise ValueError(f"sageattn_v3_hybrid needs rank-4 (bs, seqlen, nhead, headdim) inputs, got {tuple(q.shape)}")
+
+    _bs, s_q, _h_q, d = q.shape
+    if k.shape[1] != s_q:
+        raise ValueError(
+            f"sageattn_v3_hybrid requires Sq == Skv, got Sq={s_q} Skv={k.shape[1]}. Under ring this means "
+            "either a joint K/V prefix or unequal shards (sequence-parallel padding); neither is supported."
+        )
+    # The scale is hard-wired inside the kernel, so a caller-supplied one that
+    # differs would be silently dropped.
+    if softmax_scale is not None and abs(softmax_scale - d**-0.5) > 1e-6:
+        raise ValueError(f"sageattn_v3_hybrid hard-wires scale=1/sqrt({d}); got softmax_scale={softmax_scale}")
+
+    # B=1 only. Batched CFG (bs=2) is a loop rather than an error: the kernel is
+    # per-sequence anyway, so this costs nothing but a second launch.
+    outs, lses = [], []
+    for i in range(q.shape[0]):
+        out_i, lse_i = sageattn_v3_hybrid(
+            q[i : i + 1].contiguous(),
+            k[i : i + 1].contiguous(),
+            v[i : i + 1].contiguous(),
+            tensor_layout="NHD",
+            return_lse=True,
+        )
+        outs.append(out_i)
+        lses.append(lse_i)
+    out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+    lse = lses[0] if len(lses) == 1 else torch.cat(lses, dim=0)
+
+    # The kernel documents its LSE in the log2 domain; update_out_and_lse merges
+    # with sigmoid/logsigmoid of LSE differences, i.e. natural log. Getting this
+    # conversion wrong does not crash, it just mis-weights every ring step.
+    return out, lse.float() / _LOG2_E
 
 
 def pytorch_attn_forward(
