@@ -51,6 +51,10 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
+from vllm.logger import init_logger
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+logger = init_logger(__name__)
 
 
 class Config:
@@ -172,6 +176,28 @@ class Siglip2Attention(nn.Module):
             scale=self.scale,
             prefix=f"{prefix}.attn",
         )
+
+        # SigLIP2 has head_dim 72 (1152 / 16), so q.stride(1) is 144 bytes and the
+        # XPU flash-attn kernel refuses the tensor outright: "q stride(1)=72 is not
+        # 64-byte aligned (element_size=2). Xe2 2D block loads require 64-byte
+        # aligned base pointers." MMEncoderAttention takes no backend argument and
+        # resolves the vit backend from MultiModalConfig.mm_encoder_attn_backend,
+        # which a diffusion stage does not carry, so retarget the instance itself.
+        # forward_xpu dispatches purely on attn_backend, and TORCH_SDPA is one of
+        # the platform's supported vit backends.
+        if self.head_dim % 32 != 0 and self.attn.attn_backend in (
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.ROCM_AITER_FA,
+        ):
+            logger.info(
+                "SigLIP2 head_dim=%d is not 32-element aligned; using TORCH_SDPA "
+                "instead of %s for the vision tower.",
+                self.head_dim,
+                self.attn.attn_backend,
+            )
+            self.attn.attn_backend = AttentionBackendEnum.TORCH_SDPA
+            self.attn.is_flash_attn_backend = False
+            self.attn._fa_version = None
 
     def forward(
         self,

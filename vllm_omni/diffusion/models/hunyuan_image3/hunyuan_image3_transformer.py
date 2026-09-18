@@ -3,6 +3,7 @@
 
 import inspect
 import logging
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -2315,10 +2316,48 @@ class HunyuanImage3Model(nn.Module):
             units = tensor.shape[0] // den
             return tensor[offset * units : offset * units + units]
 
+        # Stage every checkpoint tensor through pinned host memory before any
+        # weight_loader touches it. A host->device copy whose source is a
+        # file-backed mapping (which is what safetensors hands us) cannot be DMA'd
+        # by level-zero and degrades to a per-page staged copy. Measured on this
+        # checkpoint, for the 4.08 GB of layer-0 experts:
+        #     straight from the mmap ............ 57.1s     71 MB/s
+        #     via an anonymous .clone() .......... 3.0s   1.34 GB/s
+        #     via a pinned buffer ................ 0.9s   4.59 GB/s
+        # Touching the pages from the CPU first makes the mmap case *worse*
+        # (98.5s), so the cost is in the driver's copy path, not page-cache misses
+        # -- prewarming the checkpoint does not help. Across 32 shards this is the
+        # difference between a ~70 min load and a few minutes.
+        #
+        # The buffer is allocated per tensor rather than reused because the
+        # layerwise online-quant loader buffers every tensor of a layer and
+        # replays the copies once the layer is complete (layerwise.py), so a shared
+        # buffer would be overwritten before it is consumed. Torch's host caching
+        # allocator recycles the freed pinned blocks, and peak pinned use is one
+        # layer's worth (~5 GB here).
+        #
+        # Opt-in, so nothing changes unless a caller asks for it: the numbers above
+        # are specific to this node's driver stack, and pinning costs host memory.
+        # Set VLLM_OMNI_STAGE_WEIGHTS=1 to enable (tests/hy-image3 does).
+        stage_weights = os.environ.get("VLLM_OMNI_STAGE_WEIGHTS", "0") == "1"
+        if stage_weights:
+            # load_weights runs once per shard, so say this once.
+            logger.info_once("Staging CPU checkpoint tensors through pinned host memory.")
+
+        def stage_to_pinned(tensor: torch.Tensor) -> torch.Tensor:
+            try:
+                return tensor.pin_memory()
+            except (RuntimeError, NotImplementedError):
+                # No pinned-memory allocator: anonymous memory is still ~19x
+                # faster than copying out of the mapping.
+                return tensor.clone()
+
         for name, loaded_weight in weights:
             if contains_unexpected_keyword(name, unexpected_keywords):
                 logger.warning("Skipping unexpected weight name: %s", name)
                 continue
+            if stage_weights and loaded_weight.device.type == "cpu":
+                loaded_weight = stage_to_pinned(loaded_weight)
             if "rotary_emb.inv_freq" in name:
                 continue
             if "gate_proj_bias" in name:

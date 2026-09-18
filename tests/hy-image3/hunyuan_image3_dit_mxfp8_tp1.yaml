@@ -1,0 +1,64 @@
+# HunyuanImage-3.0-Instruct-Distil: DiT-only, one XPU card, TP=1, online MXFP8.
+#
+# Why DiT-only rather than the default AR+DiT `hunyuan_image_3_moe.yaml`:
+# HunyuanImage-3.0 is a single 80B MoE backbone that each stage instantiates
+# separately, so AR+DiT needs two full copies of the weights. The checkpoint is
+# 168.6 GB of BF16 safetensors -> ~85 GB once W8A8 MXFP8 quantises the linears
+# and the routed experts at load time, which fits one 121.6 GiB card but is
+# nowhere near half of it. Dropping the AR stage also drops CoT / recaption, so
+# requests must ask for direct generation (`bot_task: vanilla`, which the
+# single-stage normaliser maps to the model's own `image` task).
+#
+# Everything the `xpu:` block of vllm_omni/deploy/hunyuan_image3_dit.yaml pins
+# for the 8-card layout (tensor_parallel_size: 8, expert parallel,
+# quantization: fp8) is replaced here. `quantization` has to live in this file
+# rather than on the serve command line: async_omni_engine.py only applies the
+# CLI `--quantization` when the stage left the field unset, so a stage value
+# always wins. For a diffusion stage the string is mapped onto
+# `quantization_config` and built by vllm_omni/quantization/factory.py, and
+# because no `is_checkpoint_mxfp8_serialized` flag is present this resolves to
+# the online path (VllmMxfp8OnlineLinearMethod + VllmMxfp8OnlineMoEMethod);
+# native offline MXFP8 is explicitly unsupported on XPU.
+pipeline: hunyuan_image3_dit
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    # Logical index, mapped onto the physical card through ZE_AFFINITY_MASK by
+    # set_stage_devices(), so the launcher's mask selects which card is used.
+    devices: "0"
+    # >1 would put the pipeline on the grouped DiT batching path, which only
+    # supports TORCH_SDPA attention (see _ensure_grouped_attention_backend_supported).
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    quantization: mxfp8
+    # Note: the SigLIP2 tower cannot use flash-attn here (head_dim 72 -> 144-byte
+    # q stride, which the Xe2 2D block loads reject). That is handled in
+    # vllm_omni/model_executor/models/hunyuan_image3/siglip2.py, not from this file:
+    # mm_encoder_attn_backend is a MultiModalConfig field and a diffusion stage
+    # carries no MultiModalConfig, so setting it here has no effect.
+    # 1024x1024 decodes from a 64x64 latent, so neither VAE split is needed.
+    vae_use_slicing: false
+    vae_use_tiling: false
+    cache_backend:
+    cache_config:
+    enable_cache_dit_summary: false
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      # Meaningless at TP=1 and it would try to build an EP group of size 1.
+      enable_expert_parallel: false
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      allgather_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    default_sampling_params:
+      seed: 42
