@@ -798,11 +798,45 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
         # ``kv_cache_dtype`` only reaches here when the Attention layer resolved
         # --diffusion-kv-cache-dtype for this layer and step; the XPU kernel then
         # takes per-tensor FP8 K/V with {k,v}_descale and leaves Q native.
         kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata is not None else None
         fp8_kv = kv_cache_dtype == "fp8"
+
+        # Mixed causal/full masks -- HunyuanImage3 makes the prompt causal and the
+        # image-latent block bidirectional -- carry more information than a 2D
+        # padding mask, which is all _forward_varlen_masked can express. Split the
+        # sequence into causal and full pieces instead, as forward_cuda does. XPU
+        # exposes no dense flash_attn_func (utils/fa.py wires only
+        # xpu_ops.flash_attn_varlen_func), so every piece takes the varlen wrapper.
+        if full_attn_spans is not None:
+            from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+
+            if flash_attn_varlen_func is None:
+                raise ImportError("Piecewise FlashAttention on XPU requires xpu_ops.flash_attn_varlen_func")
+            if fp8_kv:
+                # _flash_varlen_wrapper has nowhere to put {k,v}_descale, so the
+                # pieces would run on unscaled FP8 K/V.
+                raise NotImplementedError(
+                    "Piecewise FlashAttention does not support FP8 KV on XPU; "
+                    "drop --diffusion-kv-cache-dtype or use DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+                )
+            self._warn_fa_deterministic_non_dense("piecewise")
+            logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
+            return piecewise_attn(
+                query,
+                key,
+                value,
+                full_attn_spans,
+                self.softmax_scale,
+                partial(
+                    FlashAttentionImpl._flash_varlen_wrapper,
+                    attn_func=flash_attn_varlen_func,
+                ),
+                query_ranges=attn_metadata.query_ranges,
+            )
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
