@@ -1,0 +1,190 @@
+# HunyuanImage-3.0-Instruct-Distil AR + DiT, two XPU cards, TP=1, online MXFP8 --
+# torch.profiler variant of hunyuan_image3_ar_dit_mxfp8_tp1.yaml.
+#
+# Identical workload to that file (same devices, quantisation, connectors,
+# sampling params, so the timings are comparable); the only additions are the
+# per-stage `profiler_config` blocks below.
+#
+# Why those blocks and not just the serve flag: --profiler-config IS a real serve
+# argument (vLLM's EngineArgs carries profiler_config, so the JSON parses), but on
+# the omni multi-stage path nothing forwards it to the stages. The CLI -> stage
+# injection loop only fills quantization, quantization_config, lora_*,
+# diffusion_attention_config, diffusion_kv_cache_*, enable_diffusion_pipeline_profiler
+# and enable_ar_profiler (async_omni_engine.py:1352-1408) -- profiler_config is not
+# in it, and the only other place it is built from CLI kwargs is
+# _create_default_diffusion_stage_cfg (async_omni_engine.py:1014), the single-stage
+# default path a deploy config replaces. Two consequences:
+#   * /start_profile and /stop_profile are not even registered unless some stage's
+#     engine_args carries a profiler_config with a `profiler` value
+#     (_should_enable_profiler_endpoints, api_server.py:229) -- it reads stage
+#     configs only, never the CLI.
+#   * worker/base.py:52 builds the profiler from vllm_config.profiler_config, which
+#     for an omni stage comes from here (stage_init_utils.py:1113 copies
+#     compilation_config/profiler_config straight through).
+# That is what its own error message says too: "For diffusion models, set
+# --profiler-config via CLI. For omni models, add profiler_config to the relevant
+# deploy config stage." The driver passes the CLI flag as well, which is harmless
+# and keeps the two spellings visible side by side.
+#
+# On XPU the wrapper is XPUTorchProfilerWrapper (platforms/xpu/profiler.py):
+# activities CPU + XPU, tables sorted on self_xpu_time_total. Each worker writes to
+# its own timestamped session directory named after stage{id}_rank{rank}
+# (_ensure_session_dir, profiler/omni_torch_profiler.py:120), so both stages can
+# share one torch_profiler_dir without colliding. Artifacts per stage: the gzipped
+# chrome trace (torch_profiler_use_gzip defaults to true) plus an .xlsx with a
+# `summary` sheet and, because record_shapes is on, a `by_shape` sheet.
+#
+# Use with: bash hy_image3_ar_dit_mxfp8weight_profile.sh
+pipeline: hunyuan_image_3_moe
+async_chunk: false
+trust_remote_code: true
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+
+stages:
+  # ---- stage 0: AR. Prompt -> CoT / recaption + <img_ratio_*> choice. ----
+  - stage_id: 0
+    devices: "0"
+    tensor_parallel_size: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    # XPU graph on the AR decode step, plus flash attention for t2i. Same three keys and
+    # the same rationale as hunyuan_image3_ar_dit_mxfp8_tp1.yaml -- read the long note
+    # there; in short, TPOT 106.1 -> 26.4 ms/token and end to end 93.1s -> 28.2s on
+    # think_recaption, because the AR was host-bound (2,329 launches per decode step, 20.4
+    # ms/token of actual device time) and a captured decode step collapses that to one
+    # replay. mode 0 = CompilationMode.NONE, so inductor still never sees the 80B MoE.
+    #
+    # Inert without VLLM_XPU_ENABLE_XPU_GRAPH=1 in the environment (xpu.py:303); the
+    # driver exports it.
+    #
+    # FLASH_ATTN here makes this file t2i-only, which matches the profiling driver's cases.
+    # An it2i capture would need this key dropped -- see the it2i test.
+    #
+    # For the traces this file exists to collect, the graph changes what is in them: a
+    # replayed decode step no longer shows ~2,329 xpu_runtime launches per step, so a
+    # stage-0 trace taken here is not comparable to the eager ones in
+    # hy_image3_logs/prof_eager_1837. Stage 1 is unaffected.
+    enforce_eager: false
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL_DECODE_ONLY
+    attention_backend: FLASH_ATTN
+    enable_prefix_caching: false
+    max_num_batched_tokens: 8192
+    quantization: mxfp8
+    worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker
+    # NOT profiled, and deliberately left with no profiler_config at all rather than
+    # merely kept out of the driver's PROFILE_STAGES: with a block here, a
+    # /start_profile carrying {"stages": null} -- the "every stage that declares a
+    # profiler_config" default -- walks straight into the crash below.
+    #
+    # The AR is the stage worth profiling (it owns ~3/4 of the request: measured
+    # stage_0_gen_ms 30-36s against stage_1_gen_ms 13s), and the capture itself works --
+    # it wrote a valid 237 MB gzipped trace for a 303-token recaption. The profiler
+    # *stop* is what breaks: the XPU PTI plugin does not implement clearActivities and
+    # Kineto turns that into an uncaught C++ exception that aborts the AR worker:
+    #   terminate called after throwing an instance of 'std::runtime_error'
+    #     Kineto Profiler on XPU got error from function
+    #     libkineto::XpuptiActivityApi::clearActivities()
+    #     XpuptiActivityApi.cpp:148. Error code: 2 (PTI_ERROR_NOT_IMPLEMENTED).
+    # /stop_profile then never answers, the stage-1 stop queued behind it never runs so
+    # that trace is lost too, and the server dies leaving an orphaned DiffusionWorker
+    # holding its card. Uncomment only to re-test that plugin.
+    #
+    # profiler_config:
+    #   profiler: torch
+    #   # Relative, exactly as passed on the command line. Resolved against the
+    #   # server process's cwd, which the driver sets to its OUT_DIR so the traces
+    #   # land next to the log instead of wherever the script was invoked from.
+    #   torch_profiler_dir: ./profile_traces
+    #   torch_profiler_record_shapes: true
+    #   # Off: with_stack is what makes the export expensive (an extra by_stack sheet
+    #   # plus two export_stacks passes, platforms/xpu/profiler.py:59-90) and it
+    #   # inflates the trace. Kernel-level attribution does not need it.
+    #   torch_profiler_with_stack: false
+    hf_overrides:
+      rope_parameters:
+        mrope_section: [0, 32, 32]
+        rope_type: default
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+    omni_kv_config:
+      need_send_cache: true
+    output_connectors:
+      to_stage_1: shared_memory_connector
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1
+      top_k: -1
+      # Headroom: measured output was 130-734 tokens across the driver's three short
+      # cases, and 8192 leaves room for the `long` one. For /v1/images/* this file is
+      # the only place max_tokens can be set (serving_chat.py:3149), and truncation
+      # here is silent -- no </recaption>, no size/ratio tokens, so stage 1 draws from
+      # a half-finished prompt. Kept equal to the non-profiling file so the timings
+      # compare; drop it to a few hundred when profiling stage 0 itself.
+      max_tokens: 8192
+      detokenize: true
+      skip_special_tokens: false
+      include_stop_str_in_output: true
+      seed: 42
+
+  # ---- stage 1: DiT. Recaption + reused KV prefix -> image. ----
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    # Matches the non-profiling file, and it is real compilation now: with
+    # `_repeated_blocks` declared on HunyuanImage3Model the runner's lazy regional
+    # compile applies to all 32 decoder layers (it used to bail at compile.py:51, and
+    # the eager traces this file produced -- 28098 kernel launches, no inductor/triton
+    # kernel among them -- were the evidence). Measured 0.620s -> 0.460s per denoise
+    # step. The traces here are therefore of the compiled graph, and the driver's
+    # warm-up request is what absorbs the ~3min one-off inductor compile.
+    enforce_eager: false
+    quantization: mxfp8
+    vae_use_slicing: false
+    vae_use_tiling: false
+    cache_backend:
+    cache_config:
+    enable_cache_dit_summary: false
+    # The stage worth tracing: 8 denoise steps of the same graph, so the trace is
+    # small and every kernel in it is on the critical path.
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: ./profile_traces
+      torch_profiler_record_shapes: true
+      torch_profiler_with_stack: false
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      allgather_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    omni_kv_config:
+      need_recv_cache: true
+      enable_kv_async_prefetch: true
+      kv_prefetch_min_free_mem_ratio: 0.2
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 42
+
+edges:
+  - from: 0
+    to: 1
+    window_size: -1
+    max_inflight: 1

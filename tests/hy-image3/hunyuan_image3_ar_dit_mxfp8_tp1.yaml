@@ -1,0 +1,277 @@
+# HunyuanImage-3.0-Instruct-Distil: AR (stage 0) + DiT (stage 1) on TWO XPU
+# cards, TP=1 each, online MXFP8, with AR->DiT KV reuse over shared memory.
+#
+# The two-stage counterpart of the single-stage files in this directory:
+# hunyuan_image3_dit_mxfp8_tp1.yaml is stage 1 alone (no CoT, so requests must
+# ask for direct generation with bot_task: vanilla) and
+# hunyuan_image3_ar_mxfp8_tp1.yaml is stage 0 alone (no image output at all).
+# `pipeline: hunyuan_image_3_moe` is what selects the two-stage graph; nothing on
+# the serve command line does.
+#
+# Why two cards and not one: HunyuanImage-3.0 is a single 80B MoE backbone and
+# each stage instantiates its own full copy of it, so this needs the weights
+# twice. The measured footprint after online MXFP8 is ~82.5 GiB, which fits one
+# 121.6 GiB card per stage and leaves ~26 GiB each for KV cache and activations
+# at gpu_memory_utilization 0.9. The AR's KV is 128 KB/token (32 layers x 8 KV
+# heads x 128 head_dim x K+V x 2B), so a few thousand CoT tokens are noise
+# against that headroom -- the weights are the whole sizing story.
+#
+# t2i ONLY: POST /v1/images/generations -- the AR thinks/recaptions, the DiT draws.
+#
+# it2i (POST /v1/images/edits with an image upload) is the other direction this
+# two-stage pipeline can serve, and it is the reason to have an AR stage at all --
+# the AR *reads* the image through its SigLIP2 tower, reasons about the edit
+# instruction, recaptions, and the DiT draws conditioned on that image (forwarded
+# by ar2diffusion as multi_modal_data["image"]); neither single-stage file can do
+# it. But it needs a different stage-0 attention backend than this file sets (see
+# attention_backend below), and that is an init-time, per-server decision, so it
+# lives in its own test: hy_image3_it2i_mxfp8weight.sh, which reuses this file
+# with that one key removed.
+# it2i is also what makes the SigLIP2 XPU fixes in
+# model_executor/models/hunyuan_image3/siglip2.py load-bearing: stage 0 builds
+# that tower with this file's quant_config, so without the block-scaled guard
+# `quantization: mxfp8` below kills stage 0 at init. t2i never notices, because
+# with no image input the tower is never called.
+#
+# Note the AR runs in *generation* mode, not comprehension mode, and that is
+# correct here: the registry gives stage 0 engine_output_type="latent"
+# (pipeline.py:35) and HunyuanImage3ForCausalMM keys `_is_comprehension` off that
+# (hunyuan_image3.py:1600), which enables the forced stage transitions
+# </think> -> <recaption> -> <answer><boi><img_size_*><img_ratio_*> and leaves
+# the image tokens unblocked -- exactly the sequence stage 1 needs. So an it2i
+# request is not "i2t then t2i": the AR never answers in prose, it recaptions.
+# (The hunyuan_image3_ar registry entry declares latent too, which is why the
+# AR-only i2t run in this directory answers with think/recaption text rather than
+# a plain description. A deploy file can override it -- engine_extras is applied
+# after ps.engine_output_type in _build_engine_args -- with
+# `engine_output_type: text`.)
+#
+# Use with: bash hy_image3_ar_dit_mxfp8weight.sh
+pipeline: hunyuan_image_3_moe
+async_chunk: false
+trust_remote_code: true
+
+connectors:
+  # The stage-0 -> stage-1 KV handoff. The committed deploy
+  # (vllm_omni/deploy/hunyuan_image_3_moe.yaml) points both stages at
+  # MooncakeTransferEngineConnector, which is not installed in this image; both
+  # stages here are processes on one host, so shared memory is the right
+  # transport anyway. /dev/shm is 502 GiB in this container, and the payload is
+  # the KV prefix up to the CoT end (~128 KB/token), so there is no sizing
+  # concern -- unlike the /dev/shm exhaustion path chunk_transfer_adapter.py
+  # warns about for large multi-request traffic.
+  shared_memory_connector:
+    name: SharedMemoryConnector
+
+stages:
+  # ---- stage 0: AR. Prompt -> CoT / recaption + <img_ratio_*> choice. ----
+  #
+  # No final_output / final_output_type / is_comprehension here, unlike the
+  # committed vllm_omni/deploy/hunyuan_image_3_moe.yaml: those three are not
+  # StageDeployConfig fields, so in a deploy file they land in engine_extras and
+  # are read by nobody. build_stage_configs() takes them from the pipeline
+  # registry instead (stage_config.py:1028-1033 <- pipeline.py:25-47), which
+  # already declares stage 0 a text terminal (the CoT is a real output) and
+  # stage 1 an image terminal. An image request still resolves to stage 1
+  # because get_final_stage_id_for_e2e() scans stages from the last backwards.
+  # The CoT reaches the response independently of all this, as
+  # prompt["extra"]["ar_generated_text"] on the stage-1 request (set by
+  # ar2diffusion, stage_input_processors/hunyuan_image3.py:189) which the images
+  # endpoint returns as `cot_output`.
+  - stage_id: 0
+    # Logical indices, mapped onto physical cards through ZE_AFFINITY_MASK by
+    # set_stage_devices(), so the launcher's mask picks which two cards are used
+    # and this file only says "the first one" / "the second one".
+    devices: "0"
+    tensor_parallel_size: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    # ---- the AR's decode latency: XPU graph + (for t2i) flash attention ----
+    #
+    # Measured on think_recaption, 3 reps per arm in the same server hour
+    # (hy_image3_ar_tpot_arms.sh): TPOT 106.1 -> 26.4 ms/token, stage_0_gen_ms 81-85s ->
+    # 19.6-21.1s, end to end 93.1s -> 28.2s. TTFT 350 -> 270 ms. Run-to-run spread also
+    # collapses, 5 ms -> 0.4 ms.
+    #
+    # Why it is that large: the AR was never compute-bound. Its device time is 20.4
+    # ms/token, against a 106 ms TPOT -- 2,329 device ops per decode step, ~31 us of wall
+    # clock per launch, ~78% of the step spent on the host issuing them. Capturing the
+    # decode step replaces all of those with one graph replay, and the measured 26.4 ms
+    # lands just above that 20.4 ms device floor, which is the check that says the win is
+    # real and roughly maximal. Capture itself is free: "Graph capturing finished in 1
+    # secs, took 0.00 GiB", because max_num_seqs is 1 so there is exactly one shape.
+    #
+    # false rather than true, but note what that does NOT mean here: compilation_config
+    # below pins mode to NONE, so the 80B MoE still runs eager op-by-op and inductor never
+    # sees it. enforce_eager is what bundles the two decisions together
+    # (vllm/config/vllm.py:1267 sets mode=NONE *and* cudagraph_mode=NONE); unbundling them
+    # is the whole point -- graphs are worth 4x, inductor over an 80B MoE is an unexercised
+    # risk, and gpu_model_runner.py:5597 wraps the model in CUDAGraphWrapper whenever the
+    # mode has full cudagraphs regardless of whether anything was compiled.
+    enforce_eager: false
+    # FULL_DECODE_ONLY, not FULL: prefill length varies per request and only captured
+    # shapes replay, while decode is uniform at max_num_seqs 1 and is where all of the TPOT
+    # lives. mode 0 is CompilationMode.NONE (see enforce_eager above). This is a
+    # first-class StageDeployConfig field (stage_config.py:385) forwarded verbatim into the
+    # stage's engine args (stage_init_utils.py:1113).
+    #
+    # This block is inert without VLLM_XPU_ENABLE_XPU_GRAPH=1 in the server's environment:
+    # vllm/platforms/xpu.py:303 pins cudagraph_mode back to NONE and logs "XPU Graph is
+    # disabled by environment variable". The drivers in this directory export it; a
+    # hand-rolled launch must too, and the log line to check for is "Capturing CUDA graphs
+    # (decode, FULL)".
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL_DECODE_ONLY
+    # t2i ONLY. HunyuanImage3 is a multimodal prefix-LM, so vLLM's XPU selector normally
+    # refuses flash attention for this model and falls back to Triton
+    # (vllm/platforms/xpu.py:181); xpu.py:172 honours an explicit request instead, with the
+    # warning that the prefix-LM bidirectional mask cannot be applied and "image/video
+    # inputs will produce incorrect results; only use this for text-only workloads". The
+    # mask it cannot apply only exists for image tokens, so a text-only AR context is plain
+    # causal and this is correct -- but an it2i / edit request through this file is
+    # silently wrong, not an error. That is why it2i now has its own test,
+    # hy_image3_it2i_mxfp8weight.sh: the backend is an init-time, per-server decision
+    # (xpu.py picks one backend class per model before any request arrives), so one server
+    # cannot serve both flows correctly and the split has to be at the deploy level. That
+    # script derives its deploy from this file with this one key removed.
+    #
+    # Worth little on its own: attention is 2.0% of AR device time, and the 4x above was
+    # measured with both levers on, so the split between them is not known -- almost
+    # certainly the graph. Kept because for t2i it is free.
+    attention_backend: FLASH_ATTN
+    enable_prefix_caching: false
+    # 8192 rather than the AR-only file's 32768: the memory-profiling run sizes
+    # its activation peak from this value, and a t2i prompt is a few hundred
+    # tokens, so a larger budget raises the peak without ever being used.
+    max_num_batched_tokens: 8192
+    # Goes through vLLM's own registry ("mxfp8" is in vllm QUANTIZATION_METHODS),
+    # unlike stage 1 below. Must live here and not on the command line:
+    # async_omni_engine.py only applies the CLI --quantization when the stage
+    # left the field unset, so a stage value always wins. The committed 8-card
+    # XPU deploy uses fp8 (per-tensor) instead; mxfp8 is what the single-card
+    # runs in this directory validated.
+    quantization: mxfp8
+    # Carried over from the committed AR deploy: the XPU AR worker installs the
+    # omni hooks the shared stage plumbing expects and forces the v1 runner.
+    worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker
+    # Not optional: HunyuanImage3 uses mrope and the checkpoint's rope_parameters
+    # do not carry the section layout.
+    hf_overrides:
+      rope_parameters:
+        mrope_section: [0, 32, 32]
+        rope_type: default
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      # Meaningless at TP=1 and it would try to build an EP group of size 1.
+      enable_expert_parallel: false
+    omni_kv_config:
+      need_send_cache: true
+    output_connectors:
+      to_stage_1: shared_memory_connector
+    default_sampling_params:
+      temperature: 0.0
+      # Greedy, so the AR's CoT is reproducible run to run. top_p/top_k are the
+      # unrestricted values rather than the AR-only file's 0.95/1024, which only
+      # matter once temperature > 0.
+      top_p: 1
+      top_k: -1
+      # Headroom, not a target. Measured num_tokens_out for the driver's short cases:
+      # 290 (recaption), 734 (think_recaption), 130 (edit). 8192 rather than 5120 so the
+      # driver's `long` case -- the one built to push the CoT into the thousands -- has
+      # room to finish, because truncation is silent damage rather than an error: the
+      # AR stops without emitting </recaption> or the size/ratio tokens, so stage 1
+      # gets a half-finished prompt. Only this file can set it: for /v1/images/* the
+      # AR's max_tokens is the deploy default and nothing in the request overrides it
+      # (serving_chat.py:3149). Cost of the headroom is KV reservation only,
+      # ~128 KB/token, so ~1 GiB at 8192 against ~26 GiB spare on the card, and well
+      # inside the checkpoint's max_position_embeddings of 22800.
+      # The AR still normally stops on its own before this: at </recaption> when
+      # the request pins a size, on <img_ratio_*> when it does not
+      # (resolve_stop_token_ids, then _extract_ratio_index reads the choice back).
+      max_tokens: 8192
+      detokenize: true
+      # The stage-1 input processor works on the token sequence, and the ratio and
+      # CoT-end markers are special tokens; dropping them from the text would also
+      # hide them from the returned cot_output.
+      skip_special_tokens: false
+      include_stop_str_in_output: true
+      # The request's own "seed" is only pushed onto the stage the serving code
+      # considers the comprehension stage, and that flag comes from
+      # ps.owns_tokenizer, which is False for this pipeline -- so the AR's seed
+      # is whatever this file says. Greedy above makes that moot; it matters if
+      # temperature is raised. The AR's stop tokens are unaffected: they are
+      # applied by stage_type == "llm" (serving_chat.py:3138).
+      seed: 42
+
+  # ---- stage 1: DiT. Recaption + reused KV prefix -> image. ----
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    # false, i.e. torch.compile is requested for the DiT -- and it now takes effect.
+    # The runner arms lazy *regional* compilation (diffusion_model_runner.py:251,
+    # "lazy regional torch.compile with dynamic=True"), which used to end at
+    # compile.py:51 "Regional compilation skipped because the model does not define
+    # `_repeated_blocks`": HunyuanImage3's transformer did not declare that attribute,
+    # so nothing was compiled and the DiT ran eager (28098 kernel launches per request
+    # and not one inductor/triton kernel in the trace). With
+    # `_repeated_blocks = ["HunyuanImage3DecoderLayer"]` on HunyuanImage3Model the log
+    # instead says "Regional compilation applied to 32 module(s)" and the measured
+    # effect on the recaption case is:
+    #   model.forward     0.620s -> 0.460s per denoise step (-26%)
+    #   pipeline.forward  6.50s  -> 5.40s   (vae.decode is 1.35s of that, unchanged)
+    # paid for once by a ~3min first request while inductor compiles the block, which
+    # is why the profiling driver's warm-up request exists.
+    # Stage 0 is also enforce_eager: false now, but for a different reason and with a
+    # different effect: there it buys XPU graph capture with compilation mode pinned to
+    # NONE, so the 80B MoE AR still never reaches inductor (which remains an unexercised
+    # risk). Here the DiT genuinely is compiled.
+    enforce_eager: false
+    # No distributed_executor_backend here, unlike the committed TP=2 deploy:
+    # "mp" spawns a worker that re-imports __main__, and at TP=1 the in-process
+    # path the DiT-only file uses is both available and one less moving part.
+    #
+    # For a diffusion stage this string is mapped onto quantization_config and
+    # built by vllm_omni/quantization/factory.py; with no
+    # is_checkpoint_mxfp8_serialized flag in the checkpoint it resolves to the
+    # online path (VllmMxfp8OnlineLinearMethod + VllmMxfp8OnlineMoEMethod).
+    # Offline MXFP8 is explicitly unsupported on XPU.
+    quantization: mxfp8
+    # 1024x1024 decodes from a 64x64 latent, so neither VAE split is needed.
+    vae_use_slicing: false
+    vae_use_tiling: false
+    cache_backend:
+    cache_config:
+    enable_cache_dit_summary: false
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      allgather_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    omni_kv_config:
+      need_recv_cache: true
+      enable_kv_async_prefetch: true
+      kv_prefetch_min_free_mem_ratio: 0.2
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 42
+
+edges:
+  - from: 0
+    to: 1
+    window_size: -1
+    # One request in flight, matching max_num_seqs: 1 on both stages.
+    max_inflight: 1

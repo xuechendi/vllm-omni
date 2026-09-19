@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import gc
 import math
+import os
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal, TypeAlias
@@ -204,6 +205,25 @@ class HunyuanModel(HunYuanModel):
 
         skipped_unexpected: set[str] = set()
 
+        # Same opt-in staging as the DiT loader (see load_weights in
+        # vllm_omni/diffusion/models/hunyuan_image3/hunyuan_image3_transformer.py for
+        # the measurements): a host->device copy out of the safetensors mapping cannot
+        # be DMA'd by level-zero and crawls, while a pinned intermediate runs at
+        # ~4.6 GB/s. The AR stage instantiates the same 80B backbone, so it pays the
+        # same cost. Off unless VLLM_OMNI_STAGE_WEIGHTS=1.
+        stage_weights = os.environ.get("VLLM_OMNI_STAGE_WEIGHTS", "0") == "1"
+        if stage_weights:
+            # One shard per call, so say this once.
+            logger.info_once("Staging CPU checkpoint tensors through pinned host memory.")
+
+        def stage_to_pinned(tensor: torch.Tensor) -> torch.Tensor:
+            try:
+                return tensor.pin_memory()
+            except (RuntimeError, NotImplementedError):
+                # No pinned-memory allocator: anonymous memory is still much
+                # faster than copying out of the mapping.
+                return tensor.clone()
+
         for name, loaded_weight in weights:
             if contains_unexpected_keyword(name, unexpected_keywords):
                 skipped_unexpected.add(name)
@@ -211,6 +231,10 @@ class HunyuanModel(HunYuanModel):
 
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # After the cheap skips, so nothing is staged that gets thrown away.
+            if stage_weights and loaded_weight.device.type == "cpu":
+                loaded_weight = stage_to_pinned(loaded_weight)
 
             if "gate_proj_bias" in name:
                 name = name.replace("gate_proj_bias", "gate_proj.bias")

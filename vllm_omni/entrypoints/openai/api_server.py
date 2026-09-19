@@ -1987,6 +1987,7 @@ def _build_image_generation_response(
     stage_durations: Any,
     peak_memory_mb: Any,
     response_metrics: Any = None,
+    cot_output: str | None = None,
 ) -> ImageGenerationResponse | StreamingResponse:
     """Encode generated images and apply the requested response format."""
     output_format = _choose_output_format(request.output_format or "png", None)
@@ -2012,6 +2013,8 @@ def _build_image_generation_response(
     size = _generated_size_str(images, request.size)
     if size is not None:
         response_kwargs["size"] = size
+    if cot_output is not None:
+        response_kwargs["cot_output"] = cot_output
     response = ImageGenerationResponse(**response_kwargs)
     if request.response_format == ResponseFormat.FILE:
         return response.stream_response()
@@ -2123,13 +2126,17 @@ async def generate_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     content=generation_result.model_dump(),
                 )
-            flat_images, stage_durations, peak_memory_mb, _, response_metrics = generation_result
+            flat_images, stage_durations, peak_memory_mb, cot_output, response_metrics = generation_result
             return _build_image_generation_response(
                 images=flat_images,
                 request=request,
                 stage_durations=stage_durations,
                 peak_memory_mb=peak_memory_mb,
                 response_metrics=response_metrics,
+                # T2I through a CoT pipeline produces a recaption just as IT2I does;
+                # dropping it here was the only reason /v1/images/generations answered
+                # with cot_output: null while /v1/images/edits returned it.
+                cot_output=cot_output,
             )
 
         # Build params - pass through user values directly

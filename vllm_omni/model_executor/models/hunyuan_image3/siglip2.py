@@ -344,6 +344,19 @@ class Siglip2Encoder(nn.Module):
         return hidden_states
 
 
+def _linear_scale_block_size(quant_config: QuantizationConfig | None) -> int | None:
+    """Block size a config's linear weight scales impose on the contracted dim.
+
+    None when there is no quantisation, when the config does not describe its scales
+    this way (checkpoint-serialized configs do not), or when the scale is per-tensor /
+    per-channel and so carries no block constraint.
+    """
+    spec = getattr(getattr(quant_config, "args", None), "linear", None)
+    group_shape = getattr(getattr(getattr(spec, "weight", None), "scale", None), "group_shape", None)
+    col = getattr(group_shape, "col", None)
+    return col if isinstance(col, int) and col > 1 else None
+
+
 class Siglip2VisionTransformer(nn.Module):
     def __init__(
         self,
@@ -355,6 +368,34 @@ class Siglip2VisionTransformer(nn.Module):
         config = Config(config)
         self.config = config
         self.embed_dim = config.hidden_size
+
+        # Block-scaled quantisation needs each linear's contracted dimension to be a
+        # multiple of the scale block, and SigLIP2's MLP is 1152 -> 4304 with
+        # 4304 % 32 == 16, so fc2's create_weights() raises
+        #   "MXFP8 requires input_size_per_partition (4304) to be divisible by 32"
+        #   vllm/model_executor/layers/quantization/online/mxfp8.py:53
+        # before a single weight is read, taking the stage down at init. The tower is
+        # ~0.4B parameters against an 80B backbone, so leaving it in the checkpoint
+        # dtype costs almost nothing; quantising the backbone is the point.
+        #
+        # Keyed on the config's own scale group shape rather than on its name: online
+        # MXFP8 reports get_name() == "online" (one config covering several schemes),
+        # so a name test would miss it. A per-tensor or per-channel scale has no
+        # contracted-dim block and is left alone, which is what the committed 8-card
+        # AR deploy (quantization: fp8) uses. Both dims are checked because each is
+        # the contracted dimension of some linear here: qkv/out/fc1 contract over
+        # hidden_size, fc2 over intermediate_size.
+        block = _linear_scale_block_size(quant_config)
+        if block is not None and any(size % block != 0 for size in (config.hidden_size, config.intermediate_size)):
+            logger.info(
+                "SigLIP2 dims (hidden=%d, intermediate=%d) are not %d-element aligned; "
+                "running the vision tower unquantised instead of %s.",
+                config.hidden_size,
+                config.intermediate_size,
+                block,
+                quant_config.get_name(),
+            )
+            quant_config = None
 
         self.embeddings = Siglip2VisionEmbeddings(config)
         self.encoder = Siglip2Encoder(

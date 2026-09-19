@@ -494,6 +494,69 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
 
 
 @pytest.mark.cpu
+def test_piecewise_flash_attn_xpu_splits_mixed_causal_full_mask(monkeypatch):
+    """forward_xpu must split a mixed causal/full sequence instead of reading the mask.
+
+    HunyuanImage3 hands the backend a 4D [B, H, Q, K] mask -- causal over the prompt,
+    bidirectional inside the image block -- alongside full_attn_spans. Before the
+    piecewise route existed that mask reached _forward_varlen_masked and tripped its
+    2D assertion. XPU exposes no dense flash_attn_func, so each piece has to go
+    through the varlen wrapper. CPU-only: the kernel is faked.
+    """
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((q.shape[0], k.shape[0], kwargs))
+        return q
+
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+
+    seq_len, prompt_len, num_heads, head_dim = 6, 2, 2, 8
+    query = torch.randn(1, seq_len, num_heads, head_dim)
+    # The mask the model builds: tril, with the image block promoted to full attention.
+    mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
+    mask[prompt_len:, prompt_len:] = True
+    metadata = AttentionMetadata(
+        attn_mask=mask[None, None],
+        full_attn_spans=[[(prompt_len, seq_len)]],
+    )
+
+    impl = FlashAttentionImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=0.5, causal=False)
+    output = impl.forward_xpu(query, query, query, metadata)
+
+    assert output.shape == query.shape
+    # Causal prefix over the prompt, then the image block attending over everything.
+    assert len(calls) == 2
+    q_rows, k_rows, kwargs = calls[0]
+    assert (q_rows, k_rows) == (prompt_len, prompt_len)
+    assert kwargs["max_seqlen_q"] == prompt_len
+    assert kwargs["max_seqlen_k"] == prompt_len
+    assert kwargs["causal"] is True
+    q_rows, k_rows, kwargs = calls[1]
+    assert (q_rows, k_rows) == (seq_len - prompt_len, seq_len)
+    assert kwargs["max_seqlen_q"] == seq_len - prompt_len
+    assert kwargs["max_seqlen_k"] == seq_len
+    assert kwargs["causal"] is False
+    assert kwargs["softmax_scale"] == 0.5
+
+
+@pytest.mark.cpu
+def test_piecewise_flash_attn_xpu_rejects_fp8_kv(monkeypatch):
+    """FP8 KV has no descale path through the piecewise wrapper, so it must not run."""
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    metadata = AttentionMetadata(full_attn_spans=[[(0, 4)]], extra={"kv_cache_dtype": "fp8"})
+
+    with pytest.raises(NotImplementedError, match="Piecewise FlashAttention does not support FP8 KV"):
+        impl.forward_xpu(query, query, query, metadata)
+
+
+@pytest.mark.cpu
 def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch):
     calls = []
 

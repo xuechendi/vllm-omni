@@ -1,0 +1,54 @@
+# HunyuanImage-3.0-Instruct-Distil: AR-only, one XPU card, TP=1, online MXFP8.
+#
+# The AR-only counterpart of hunyuan_image3_dit_mxfp8_tp1.yaml, for image-to-text
+# and text-to-text. Nothing here generates images: the DiT stage is absent, so a
+# request that asks for an image has no stage to run it.
+#
+# This replaces everything the `xpu:` block of vllm_omni/deploy/hunyuan_image3_ar.yaml
+# pins for the 8-card layout (tensor_parallel_size: 8, expert parallel,
+# quantization: fp8). Same one-card sizing argument as the DiT file: the 80B MoE
+# backbone is ~85 GB once W8A8 MXFP8 quantises the linears and routed experts at
+# load time, which fits a single 121.6 GiB card and leaves room for KV cache.
+#
+# `quantization` must live here rather than on the serve/Omni command line:
+# async_omni_engine.py only applies the CLI value when the stage left the field
+# unset, so a stage value always wins. Unlike the diffusion stage this goes
+# through vLLM's own registry ("mxfp8" is in vllm QUANTIZATION_METHODS), not
+# vllm_omni/quantization/factory.py.
+pipeline: hunyuan_image3_ar
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    # Logical index, mapped onto the physical card through ZE_AFFINITY_MASK by
+    # set_stage_devices(), so the launcher's mask selects which card is used.
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 32768
+    quantization: mxfp8
+    # Carried over from the committed AR deploy: the XPU AR worker installs the
+    # omni hooks the shared stage plumbing expects and forces the v1 model runner.
+    worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker
+    # From the base deploy, not optional: HunyuanImage3 uses mrope and the
+    # checkpoint's rope_parameters do not carry the section layout.
+    hf_overrides:
+      rope_parameters:
+        mrope_section: [0, 32, 32]
+        rope_type: default
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      # Meaningless at TP=1 and it would try to build an EP group of size 1.
+      enable_expert_parallel: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 0.95
+      top_k: 1024
+      max_tokens: 1024
+      detokenize: true

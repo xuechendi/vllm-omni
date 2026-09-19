@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import regex as re
@@ -2114,6 +2114,15 @@ class HunyuanImagePostprocessor(nn.Module):
 
 
 class HunyuanImage3Model(nn.Module):
+    # The 32 identical backbone layers, so `enforce_eager: false` actually compiles
+    # something: the diffusion model runner calls regionally_compile() on this module
+    # (the pipeline's _dit_modules entry) and that bails out with "Regional compilation
+    # skipped because the model does not define `_repeated_blocks`" when this is absent
+    # (diffusion/compile.py:48-51). Every other DiT in this tree declares it the same
+    # way. Compiling the layer instead of the whole model is what keeps the KV-cache
+    # manager, the forced stage transitions and the VAE outside the graph.
+    _repeated_blocks: ClassVar[list[str]] = ["HunyuanImage3DecoderLayer"]
+
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         block_forward_patterns={
             "layers": ForwardPattern.Pattern_4,

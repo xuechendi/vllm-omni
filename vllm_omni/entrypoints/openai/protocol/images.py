@@ -226,7 +226,8 @@ class ImageGenerationResponse(BaseModel):
     cot_output: str | None = Field(
         None,
         description="Chain-of-thought text output from the AR stage. "
-        "Only present for image editing (IT2I) with CoT-enabled models.",
+        "Present for both T2I and image editing (IT2I) on multi-stage CoT-enabled "
+        "pipelines; null when the deployment has no AR stage.",
     )
     metrics: dict[str, Any] | None = Field(
         default=None,
