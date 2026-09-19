@@ -83,6 +83,7 @@ from vllm_omni.diffusion.forward_context import (
     paged_kv_prefill,
     set_forward_context_denoise_step_idx,
 )
+from vllm_omni.diffusion.graph import write_through
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -918,8 +919,16 @@ class ImageKVCacheManager(nn.Module):
         self.scaling = scaling
         # cache related
         self.image_token_len: int = image_token_len
+        # The active prompt KV cache. Its backing storage is owned separately,
+        # because clearing the active pointers for a new request must not orphan
+        # buffers whose addresses a captured denoise graph is holding.
         self.image_kv_cache_map: tuple[torch.Tensor, torch.Tensor] | None = None
         self.image_kv_cache_lens: torch.Tensor | None = None
+        self._prompt_kv_storage: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._prompt_kv_lens_storage: torch.Tensor | None = None
+        # Set when that storage had to move; read and cleared by the pipeline, which
+        # then drops any graph whose recorded kernels point at the old buffers.
+        self.prompt_kv_reallocated: bool = False
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
@@ -1002,9 +1011,26 @@ class ImageKVCacheManager(nn.Module):
             cached_prompt_len = int(cached_prompt_lens[b].item())
             cached_key[b, :cached_prompt_len] = key[b, :cached_prompt_len]
             cached_value[b, :cached_prompt_len] = value[b, :cached_prompt_len]
-        self.image_kv_cache_map = (cached_key, cached_value)
-        self.image_kv_cache_lens = cached_prompt_lens
+        self.set_prompt_kv_cache(cached_key, cached_value, cached_prompt_lens)
         return key, value
+
+    def set_prompt_kv_cache(self, key: torch.Tensor, value: torch.Tensor, lens: torch.Tensor) -> None:
+        """Publish the prompt KV for the denoise steps, keeping the storage put.
+
+        The denoise steps read these buffers off the module rather than off their
+        arguments, so a captured graph holds their addresses directly: reusing the
+        storage whenever the shape allows is what lets one capture serve more than
+        one request. Where it cannot be reused, ``prompt_kv_reallocated`` says so
+        and the pipeline drops the graphs that just became stale.
+        """
+        prev_key, prev_value = self._prompt_kv_storage or (None, None)
+        reused_key = write_through(prev_key, key)
+        reused_value = write_through(prev_value, value)
+        self.prompt_kv_reallocated = reused_key is key or reused_value is value
+        self._prompt_kv_storage = (reused_key, reused_value)
+        self._prompt_kv_lens_storage = write_through(self._prompt_kv_lens_storage, lens)
+        self.image_kv_cache_map = self._prompt_kv_storage
+        self.image_kv_cache_lens = self._prompt_kv_lens_storage
 
     def _reuse_prompt_kv(
         self,
@@ -1079,7 +1105,11 @@ class ImageKVCacheManager(nn.Module):
         return key, value
 
     def clear_legacy_prompt_kv_cache(self) -> None:
-        """Drop model-owned dense KV state before Scheduler-paged execution."""
+        """Drop model-owned dense KV state before Scheduler-paged execution.
+
+        Only the active pointers: ``_prompt_kv_storage`` keeps the buffers so the
+        next prefill can write through them instead of stranding a captured graph.
+        """
 
         self.image_kv_cache_map = None
         self.image_kv_cache_lens = None
@@ -3379,7 +3409,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     )
 
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                        model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
+                        model_output = self.model._denoise_forward(model_inputs, first_step=(i == 0))
                         pred = model_output["diffusion_prediction"]
                     pred = pred.to(dtype=torch.float32)
 
