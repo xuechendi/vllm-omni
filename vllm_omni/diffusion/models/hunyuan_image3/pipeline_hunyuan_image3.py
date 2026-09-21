@@ -392,6 +392,8 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
+        if quant_config is not None:
+            quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper.get_rename_mapper())
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
         # Lazy import to break circular dependency:

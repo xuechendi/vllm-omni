@@ -114,7 +114,7 @@ class HunyuanModel(HunYuanModel):
         num_attention_heads = self.config.num_attention_heads
         num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         num_key_value_groups = num_attention_heads // num_kv_heads
-        hidden_size = self.config.hidden_size
+        input_size = qkv.shape[-1]
 
         if hasattr(self.config, "head_dim"):
             attention_head_dim = self.config.head_dim
@@ -123,11 +123,11 @@ class HunyuanModel(HunYuanModel):
         else:
             attention_head_dim = self.config.hidden_size // num_attention_heads
 
-        qkv = qkv.reshape(num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size)
+        qkv = qkv.reshape(num_kv_heads, num_key_value_groups + 2, attention_head_dim, input_size)
         q, k, v = torch.split(qkv, (num_key_value_groups, 1, 1), dim=1)
-        q = q.reshape(-1, hidden_size)
-        k = k.reshape(-1, hidden_size)
-        v = v.reshape(-1, hidden_size)
+        q = q.reshape(-1, input_size)
+        k = k.reshape(-1, input_size)
+        v = v.reshape(-1, input_size)
         return torch.concat((q, k, v))
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

@@ -8,9 +8,13 @@ from os.path import commonprefix
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
 from vllm.model_executor.models.utils import WeightsMapper
+
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.mxfp8_moe import VllmMxfp8OfflineMoEMethod
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -23,6 +27,8 @@ _REGEX_SPECIAL_CHARS = frozenset(r"*+?^$()[]{}|\\")
 def _stage_prefix(prefix_map: dict[str, str | None]) -> str:
     """Derive the container/stage prefix from mapper source keys."""
     cp = commonprefix(list(prefix_map.keys()))
+    if cp == "model.":
+        return ""
     dot = cp.rfind(".")
     return cp[: dot + 1] if dot >= 0 else ""
 
@@ -57,6 +63,8 @@ class OmniINCConfig(INCConfig):
       - AutoRound INT4/INT8 → vLLM INCWna16Scheme
       - AutoRound MXFP4 / MXFP8 linears (data_type="mx_fp") → vLLM INCMxfp4Scheme /
         INCMxfp8Scheme, wrapped by :class:`_MXFlattenedLinearMethod`
+      - AutoRound MXFP8 MoE → VllmMxfp8OfflineMoEMethod, because INCMxfp8Scheme has no
+        get_moe_method (INCScheme's default raises); MXFP4 MoE is INCMxfp4Scheme's own
       - AutoRound NVFP4 (data_type="nv_fp") → vLLM CompressedTensorsW4A4Fp4
       - Native MXFP8 (quant_method="mxfp8") → DiffusionMXFP8Config (see mxfp8_config.py)
     """
@@ -69,7 +77,12 @@ class OmniINCConfig(INCConfig):
     # ------------------------------------------------------------------
 
     def get_quant_method(self, layer, prefix: str):
-        """vLLM's method, wrapped for diffusion's 3-D activations on MX linears."""
+        """vLLM's method, wrapped for diffusion's 3-D activations on MX linears.
+
+        MXFP8 MoE is the one exception: INCMxfp8Scheme implements no get_moe_method,
+        so vLLM would raise for RoutedExperts and omni's method is still needed.
+        It stays XPU-gated because that kernel is XPU-only.
+        """
         if self.data_type == "nv_fp":
             from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -87,6 +100,11 @@ class OmniINCConfig(INCConfig):
                 layer.scheme = scheme
                 return CompressedTensorsLinearMethod(self)
             return None
+
+        if self.is_mxfp and current_omni_platform.is_xpu() and isinstance(layer, RoutedExperts):
+            layer_config = self.config_parser.resolve(layer, prefix)
+            if layer_config.quantized and layer_config.is_mxfp8:
+                return VllmMxfp8OfflineMoEMethod(layer=layer)
 
         method = super().get_quant_method(layer, prefix)
         if self.is_mxfp and isinstance(method, INCLinearMethod):

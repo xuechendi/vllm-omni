@@ -1722,7 +1722,8 @@ class HunYuanSparseMoeBlock(nn.Module):
             config.num_experts,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate",
+            # Preserve the original Hunyuan module path for quantization lookup.
+            prefix=f"{prefix}.gate.wg",
         )
         if config.use_mixed_mlp_moe > 0:
             # Get layer_id num_shared_expert if config.num_shared_expert is

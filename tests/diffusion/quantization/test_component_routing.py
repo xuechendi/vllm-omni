@@ -95,6 +95,13 @@ TALKER_MAPPER = WeightsMapper(
 
 
 class TestApplyVllmMapper:
+    def test_root_model_prefix_is_removed(self):
+        cfg = _make_inc_config("model.layers")
+        cfg.apply_vllm_mapper(
+            WeightsMapper(orig_to_new_prefix={"model.": ""})
+        )
+        assert cfg.block_name_to_quantize == ["layers"]
+
     def test_inc_csv_string_normalized_to_list(self):
         """CSV string block_name_to_quantize is split into a list."""
         cfg = _make_inc_config("thinker.model.layers,talker.model.layers")
