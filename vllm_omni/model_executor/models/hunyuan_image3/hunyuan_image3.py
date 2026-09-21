@@ -18,6 +18,7 @@ from transformers import PretrainedConfig, Siglip2ImageProcessorFast
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+import vllm._custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.multimodal import BaseDummyOptions
@@ -1375,6 +1376,43 @@ class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
         return final_hidden_states.view(orig_shape)
 
 
+_FUSED_ROPE_SUPPORTED: dict[tuple[str, torch.dtype, int], bool] = {}
+
+
+def _fused_rope_supported(device: torch.device, dtype: torch.dtype, head_dim: int) -> bool:
+    """Probe for ``_C::rotary_embedding``, cached per (device kind, dtype, head_dim).
+
+    The op ships with vLLM's CUDA/ROCm/XPU extension but not every backend
+    registers a kernel for it, so probe once on throwaway tensors rather than
+    risking a half-applied in-place rotation on real activations.
+
+    Called from ``__init__``, never from ``forward``: the synchronize below is
+    what makes the probe conclusive on an asynchronous backend (without it a
+    launch failure surfaces later, somewhere else, and the try/except is
+    decoration), and neither a synchronize nor a possibly-failing launch belongs
+    in a decode step that an XPU graph is capturing.
+    """
+    key = (device.type, dtype, head_dim)
+    cached = _FUSED_ROPE_SUPPORTED.get(key)
+    if cached is not None:
+        return cached
+    try:
+        q = torch.zeros(1, head_dim, device=device, dtype=dtype)
+        k = torch.zeros(1, head_dim, device=device, dtype=dtype)
+        cos_sin = torch.zeros(1, head_dim, device=device, dtype=dtype)
+        rows = torch.zeros(1, device=device, dtype=torch.long)
+        ops.rotary_embedding(rows, q, k, head_dim, cos_sin, True)
+        sync = getattr(getattr(torch, device.type, None), "synchronize", None)
+        if sync is not None:
+            sync()
+        supported = True
+    except Exception as exc:  # noqa: BLE001 - any failure means "use the native path"
+        logger.warning("Fused rotary_embedding unavailable (%s); using elementwise rope.", exc)
+        supported = False
+    _FUSED_ROPE_SUPPORTED[key] = supported
+    return supported
+
+
 class HunyuanImage3RotaryEmbedding(nn.Module):
     """Custom interleaved 2D Rotary Embedding for HunyuanImage3.
 
@@ -1393,19 +1431,60 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
     Reference: https://kexue.fm/archives/10352
     """
 
-    def __init__(self, head_dim: int, rope_theta: float = 10000.0) -> None:
+    def __init__(
+        self,
+        head_dim: int,
+        rope_theta: float = 10000.0,
+        producer: "HunyuanImage3RotaryEmbedding | None" = None,
+        max_tokens: int = 0,
+    ) -> None:
         super().__init__()
         self.head_dim = head_dim
         assert head_dim % 4 == 0, f"head_dim must be divisible by 4, got {head_dim}"
+        # Every layer is passed the same `positions`, so cos/sin are a per-forward-pass value,
+        # not a per-layer one. `producer` is the instance that computes them (the first layer);
+        # the rest read its result. Not a cache keyed on `positions`: under an XPU graph the
+        # positions buffer is updated by a raw memcpy that bumps no version counter, so any such
+        # key compares equal on every decode step and the whole sequence gets step 0's rope.
+        self._producer = producer
+        self._cos_sin_cache: torch.Tensor | None = None
+        self._rows: torch.Tensor | None = None
+        self._cos: torch.Tensor | None = None
+        self._sin: torch.Tensor | None = None
+        self._cos_sin_buf: torch.Tensor | None = None
+        self._rows_buf: torch.Tensor | None = None
+        self._use_fused = False
+        # Bumped once per produced table and checked by every consumer, so a forward pass
+        # that somehow skips the producer raises instead of silently applying the previous
+        # step's rope. Costs one int compare per layer, and nothing at all under a graph
+        # replay, where no Python runs.
+        self._epoch = 0
+        self._consumed_epoch = -1
+        if producer is not None:
+            # Consumers read the producer's tables and nothing else: giving all 31 of them
+            # their own inv_freq buffers and their own probe would be dead state.
+            return
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Split once here rather than per call: the frequency interleave is fixed by head_dim.
+        self.register_buffer("inv_freq_y", inv_freq[0::2].contiguous(), persistent=False)
+        self.register_buffer("inv_freq_x", inv_freq[1::2].contiguous(), persistent=False)
+        # The construction context (base_loader.py wraps initialize_model in both
+        # `set_default_torch_dtype` and `torch.device(...)`) is what the activations will
+        # use, so probing against the defaults probes the real configuration.
+        device, dtype = torch.empty(0).device, torch.get_default_dtype()
+        self._use_fused = _fused_rope_supported(device, dtype, head_dim)
+        if self._use_fused and max_tokens > 0:
+            # Allocated once at full capacity and never reallocated. A graph captures the
+            # *address* of the table, so growing this buffer after capture would leave the
+            # replay reading freed memory, and letting each forward allocate a fresh one
+            # makes replay correctness depend on the graph pool never handing the captured
+            # block to anyone else. A request longer than the capacity falls back to a
+            # per-call allocation, which is eager-only: decode, the sole captured shape,
+            # is one token.
+            self._cos_sin_buf = torch.empty(max_tokens, head_dim, device=device, dtype=dtype)
+            self._rows_buf = torch.arange(max_tokens, device=device, dtype=torch.long)
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _freq_table(self, positions: torch.Tensor) -> torch.Tensor:
         if positions.dim() == 2 and positions.shape[0] == 3:
             y_pos = positions[1].float()
             x_pos = positions[2].float()
@@ -1415,32 +1494,89 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
             x_pos = positions.float()
 
         num_tokens = y_pos.shape[0]
-        dtype = query.dtype
-        query_shape = query.shape
-        key_shape = key.shape
-
-        inv_freq = self.inv_freq.to(device=y_pos.device, dtype=torch.float32)
-
-        inv_freq_y = inv_freq[0::2]  # even indices -> y
-        inv_freq_x = inv_freq[1::2]  # odd  indices -> x
-
-        y_freqs = y_pos.unsqueeze(-1) * inv_freq_y.unsqueeze(0)
-        x_freqs = x_pos.unsqueeze(-1) * inv_freq_x.unsqueeze(0)
+        if self.inv_freq_y.device != y_pos.device:
+            self.inv_freq_y = self.inv_freq_y.to(y_pos.device)
+            self.inv_freq_x = self.inv_freq_x.to(y_pos.device)
+        y_freqs = y_pos.unsqueeze(-1) * self.inv_freq_y.unsqueeze(0)
+        x_freqs = x_pos.unsqueeze(-1) * self.inv_freq_x.unsqueeze(0)
 
         # Interleave: [y*θ₀, x*θ₁, y*θ₂, x*θ₃, ...]
-        freqs = torch.stack([y_freqs, x_freqs], dim=-1).reshape(num_tokens, -1)
+        return torch.stack([y_freqs, x_freqs], dim=-1).reshape(num_tokens, -1)
 
-        emb = torch.cat([freqs, freqs], dim=-1)
-        cos = emb.cos().to(dtype).unsqueeze(1)
-        sin = emb.sin().to(dtype).unsqueeze(1)
+    def _produce(self, positions: torch.Tensor, dtype: torch.dtype) -> None:
+        freqs = self._freq_table(positions)
+        num_tokens = freqs.shape[0]
+        if self._use_fused:
+            # Layout expected by _C::rotary_embedding with is_neox=True: one row per
+            # token, cos in the first half and sin in the second. Feeding it row
+            # indices instead of real positions turns its cache lookup into the
+            # identity, which is what lets a 2D (y, x) rope use the fused kernel.
+            buf = self._cos_sin_buf
+            if buf is None or num_tokens > buf.shape[0] or buf.dtype != dtype or buf.device != freqs.device:
+                self._cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(dtype)
+                self._rows = torch.arange(num_tokens, device=freqs.device, dtype=torch.long)
+            else:
+                # Into the persistent buffer: both slices below are views, which drops a
+                # device allocation, the full-width fp32 concat temporary and the per-step
+                # arange, and keeps the table the graph captured alive for every replay.
+                half = self.head_dim // 2
+                buf[:num_tokens, :half].copy_(freqs.cos())
+                buf[:num_tokens, half:].copy_(freqs.sin())
+                self._cos_sin_cache = buf[:num_tokens]
+                self._rows = self._rows_buf[:num_tokens]
+        else:
+            emb = torch.cat([freqs, freqs], dim=-1)
+            self._cos_sin_cache = None
+            self._rows = None
+            self._cos = emb.cos().to(dtype).unsqueeze(1)
+            self._sin = emb.sin().to(dtype).unsqueeze(1)
+        self._epoch += 1
 
-        query = query.view(num_tokens, -1, self.head_dim)
-        key = key.view(num_tokens, -1, self.head_dim)
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._producer is None:
+            self._produce(positions, query.dtype)
+        src = self._producer or self
+        # One table per forward pass, one consumption per layer, so the producer must have
+        # produced since this layer last ran. If it has not, the producer's forward was
+        # skipped and q/k below would get the previous step's rope -- wrong, and invisible
+        # in the output, which is the one failure mode of sharing the table across layers.
+        if src._epoch == self._consumed_epoch:
+            raise RuntimeError(
+                "HunyuanImage3RotaryEmbedding: cos/sin were not recomputed for this forward "
+                "pass (the producing layer did not run); refusing to apply a stale rope."
+            )
+        self._consumed_epoch = src._epoch
 
-        query = query * cos + self._rotate_half(query) * sin
-        key = key * cos + self._rotate_half(key) * sin
+        if src._cos_sin_cache is not None:
+            # In place: q/k are fresh slices of this layer's qkv projection, and the
+            # single fused kernel replaces ~6 elementwise launches per layer. The kernel
+            # honours query.stride(-2), so the non-contiguous views that qkv.split hands
+            # it are fine, and v -- the third slice of the same buffer -- is untouched.
+            ops.rotary_embedding(src._rows, query, key, self.head_dim, src._cos_sin_cache, True)
+            return query, key
 
-        return query.view(query_shape), key.view(key_shape)
+        cos, sin = src._cos, src._sin
+        num_tokens = cos.shape[0]
+        query_3d = query.view(num_tokens, -1, self.head_dim)
+        key_3d = key.view(num_tokens, -1, self.head_dim)
+
+        # Written in place rather than returned fresh, so this path has the same aliasing
+        # as the fused one above: both leave the rotation in the caller's q/k. A rope that
+        # is in-place on one platform and not on another is a trap for the next caller,
+        # not a detail. _rotate_half allocates (it is a cat), so its result is a private
+        # temporary and taking mul_ on it is safe -- but it has to be computed before q/k
+        # are overwritten, hence the two statements per tensor.
+        q_rot = self._rotate_half(query_3d)
+        query_3d.mul_(cos).add_(q_rot.mul_(sin))
+        k_rot = self._rotate_half(key_3d)
+        key_3d.mul_(cos).add_(k_rot.mul_(sin))
+
+        return query, key
 
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         x1 = x[..., : x.shape[-1] // 2]
@@ -1653,7 +1789,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # fast path that uses this.
         self._blocked_token_ids_tensor: torch.Tensor | None = None
 
-        self._replace_rotary_embeddings()
+        self._replace_rotary_embeddings(vllm_config)
         self._patch_moe_blocks()
 
     def _patch_moe_blocks(self):
@@ -1724,7 +1860,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 "Check that model.layers[*].mlp is HunYuanSparseMoeBlock."
             )
 
-    def _replace_rotary_embeddings(self):
+    def _replace_rotary_embeddings(self, vllm_config: VllmConfig | None = None):
         """Replace vLLM's standard MRotaryEmbedding with the custom
         interleaved 2D RoPE that matches the original HunyuanImage3 model."""
         rope_theta = getattr(self.config, "rope_theta", 10000.0)
@@ -1737,14 +1873,27 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 self.config.hidden_size // self.config.num_attention_heads,
             ),
         )
-        custom_rope = HunyuanImage3RotaryEmbedding(
-            head_dim=head_dim,
-            rope_theta=rope_theta,
-        )
+        # Capacity for the producer's persistent cos/sin table. The scheduler's budget is
+        # the most tokens one forward pass can carry, so a table this size never has to
+        # grow -- see the buffer comment in __init__ for why growing it would be unsafe.
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        max_tokens = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
+        producer: HunyuanImage3RotaryEmbedding | None = None
         replaced = 0
         for layer in self.model.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
-                layer.self_attn.rotary_emb = custom_rope
+                # The first attention layer computes cos/sin; the rest read it off that
+                # instance. Layers run in order within one forward pass and all get the same
+                # `positions`, so this is the same value 32 times over -- ~10 elementwise
+                # kernels per layer per token that only need issuing once.
+                rope = HunyuanImage3RotaryEmbedding(
+                    head_dim=head_dim,
+                    rope_theta=rope_theta,
+                    producer=producer,
+                    max_tokens=max_tokens,
+                )
+                producer = producer or rope
+                layer.self_attn.rotary_emb = rope
                 replaced += 1
         logger.info(
             "Replaced %d rotary embeddings with HunyuanImage3RotaryEmbedding "
