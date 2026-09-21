@@ -38,6 +38,44 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+# --- XPU prefix-KV slicing (H3_XPU_PREFIX_KV) -------------------------------
+# MiniMax-H3 packs one request as [real tokens, tail padding].  On CUDA the
+# cuDNN backend advertises ``supports_prefix_kv_slicing`` and the model skips
+# building a padding mask; XPU used to fall back to the masked varlen path,
+# which index_selects q/k/v and scatters the output back -- four full copies of
+# a [40320, 56, 128] bf16 tensor per layer step.  Slicing K/V to the valid
+# prefix is numerically identical (the padding is a strict suffix and padding
+# query rows are dropped downstream) and is a zero-copy view.
+_XPU_PREFIX_KV_ENV = "H3_XPU_PREFIX_KV"
+
+
+def _xpu_prefix_kv_enabled() -> bool:
+    """Read once at import: the serve process sets the env before start."""
+    if not current_omni_platform.is_xpu():
+        return False
+    return os.getenv(_XPU_PREFIX_KV_ENV, "1") != "0"
+
+
+_XPU_PREFIX_KV = _xpu_prefix_kv_enabled()
+_XPU_PREFIX_KV_STATE = {"calls": 0, "sliced": 0, "announced": False}
+_XPU_PREFIX_KV_LOG_EVERY = 200
+
+
+def _reject_out_of_range_valid_kv_length(candidate: int, k_len: int) -> None:
+    """Raise unless ``0 < candidate <= k_len`` (main's cuDNN backend range).
+
+    The model that published the field skipped building its padding mask, so
+    an out-of-range value silently falling through would run unmasked
+    attention over the padding rows.  ``candidate == k_len`` is legal and
+    means "nothing to trim".
+    """
+    if not 0 < candidate <= k_len:
+        raise ValueError(
+            f"attn_metadata.extra['valid_kv_length']={candidate} is outside the "
+            f"legal range 0 < valid_kv_length <= K length ({k_len}); refusing to "
+            "run unmasked attention over padding rows"
+        )
+
 
 @cache
 def _get_npu_compressed_causal_mask(device: torch.device) -> torch.Tensor:
@@ -179,6 +217,10 @@ class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_piecewise_spans: bool = True
     supports_paged_kv: bool = True
+    # True only on XPU and only while H3_XPU_PREFIX_KV != "0".  Kept a plain
+    # bool (not a classmethod) because callers read it as an attribute -- a
+    # classmethod object would be truthy for every backend.
+    supports_prefix_kv_slicing: bool = _XPU_PREFIX_KV
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
@@ -784,6 +826,80 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             value,
         )
 
+    def _maybe_slice_prefix_kv_xpu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        attention_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Trim K/V to ``extra["valid_kv_length"]`` when the packed contract holds.
+
+        Returns the (possibly sliced) K/V.  Slicing is a view, so this is free;
+        the caller keeps Q at full length and ``_forward_varlen_dense`` already
+        handles ``q_len != k_len`` via separate cu_seqlens.
+        """
+        state = _XPU_PREFIX_KV_STATE
+        if not _XPU_PREFIX_KV:
+            if not state["announced"]:
+                state["announced"] = True
+                logger.info("[XPU_PREFIX_KV] enabled=0 (mask path)")
+            return key, value
+        state["calls"] += 1
+        used = None
+        if attn_metadata is not None and attention_mask is None and not self.is_cross_attn:
+            extra = attn_metadata.extra or {}
+            candidate = extra.get("valid_kv_length")
+            k_len = key.size(1)
+            if candidate is not None:
+                # The model saw supports_prefix_kv_slicing=True and skipped
+                # building its padding mask, so this helper is the only thing
+                # standing between the padding rows and the kernel. A contract
+                # violation must therefore raise (as main's cuDNN backend does
+                # for illegal values), not silently run unmasked attention
+                # over the padding. Cross-attn is excluded above: its K/V is
+                # not a [real, pad] prefix of Q, so the field does not apply.
+                if isinstance(candidate, bool) or not isinstance(candidate, int):
+                    raise ValueError(
+                        "attn_metadata.extra['valid_kv_length'] must be a Python int, "
+                        f"got {type(candidate).__name__} ({candidate!r}); refusing to run "
+                        "unmasked attention over padding rows"
+                    )
+                _reject_out_of_range_valid_kv_length(candidate, k_len)
+                if 0 < candidate < k_len:
+                    if key.size(0) != 1:
+                        raise ValueError(
+                            f"valid_kv_length={candidate} cannot describe a batch of "
+                            f"{key.size(0)} packed sequences; refusing to run unmasked "
+                            "attention over padding rows"
+                        )
+                    if value.size(1) != k_len:
+                        raise ValueError(
+                            f"valid_kv_length={candidate} with K length {k_len} != V length "
+                            f"{value.size(1)}; refusing to run unmasked attention over "
+                            "padding rows"
+                        )
+                    used = candidate
+        if used is not None:
+            k_len = key.size(1)
+            key = key[:, :used]
+            value = value[:, :used]
+            state["sliced"] += 1
+            if not state["announced"]:
+                state["announced"] = True
+                logger.info(
+                    "[XPU_PREFIX_KV] enabled=1 sliced kv %d->%d q=%d heads=%d dtype=%s",
+                    k_len,
+                    used,
+                    query.size(1),
+                    query.size(2),
+                    str(query.dtype).replace("torch.", ""),
+                )
+        if state["calls"] % _XPU_PREFIX_KV_LOG_EVERY == 0:
+            logger.info("[XPU_PREFIX_KV] calls=%d sliced=%d", state["calls"], state["sliced"])
+        return key, value
+
     def forward_xpu(
         self,
         query: torch.Tensor,
@@ -795,6 +911,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
         kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata is not None else None
+        key, value = self._maybe_slice_prefix_kv_xpu(query, key, value, attn_metadata, attention_mask)
         sycl_tla_impl = {
             SYCL_TLA_FP8_LABEL: sycl_tla_fp8_attn,
             SYCL_TLA_MXFP8_LABEL: sycl_tla_mxfp8_attn,

@@ -10,6 +10,8 @@ layout.
 from __future__ import annotations
 
 import math
+import os as _rl_os
+import sys as _rl_sys
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -1896,3 +1898,141 @@ __all__ = [
     "MiniMaxH3DiTModel",
     "_reorder_grouped_qkv_to_qkv",
 ]
+
+
+# ---- gemm_relayout: repack Linear weights transpose-contiguous at load time ----
+def _rl_rank() -> str:
+    """Tag self-evidence with the rank: all ranks share one serve log, so the
+    launch gate must be able to count one line per rank and attribute a bad N."""
+    for _k in ("RANK", "LOCAL_RANK", "VLLM_DP_RANK"):
+        _v = _rl_os.environ.get(_k)
+        if _v not in (None, ""):
+            return f"rank{_v}"
+    return "rank?"
+
+
+def _h3_relayout_dlo_active(root) -> bool:
+    """True when distributed/layerwise offload owns this module's weights.
+
+    DLO copies each layer from a CPU mmap source into a GPU slot using the
+    *source* stride (distributed_layerwise_backend.py), so a load-time relayout
+    is silently undone. Detect it and skip rather than print a false positive.
+
+    Read the real configuration rather than guessing from class shape:
+    MiniMaxH3DiTModel keeps ``self.od_config`` (minimax_h3_transformer.py:1080)
+    and the product tests exactly these two fields (omni_config.py:703-704, and
+    e.g. pipeline_minimax_h3.py:1537).
+
+    NOTE: do *not* test ``hasattr(type(root), "_layerwise_offload_blocks_attrs")``.
+    That is a static class attribute on MiniMaxH3DiTModel (declared alongside
+    ``_repeated_blocks`` at :993), so it is present whether or not DLO is active
+    and would make this guard unconditionally true.
+    Offload hooks are registered through HookRegistry on ``_hook_registry``
+    (distributed_layerwise_backend.py:785), *not* ``_forward_pre_hooks``, so
+    scanning the latter was dead code and has been removed. The per-tensor
+    device check in _h3_relayout_linear_weights is the backstop.
+    """
+    od = getattr(root, "od_config", None)
+    if od is not None:
+        if getattr(od, "enable_layerwise_offload", False):
+            return True
+        if getattr(od, "enable_distributed_layerwise_offload", False):
+            return True
+    if getattr(root, "_omni_layerwise_enabled", False):
+        return True
+    return False
+
+
+def _h3_relayout_linear_weights(root) -> int:
+    """Replace each Linear [out,in] weight in place with a transpose-contiguous
+    tensor of the same shape.
+
+    The shape is unchanged, so no call site needs to change; the stride becomes
+    (1, N), so the W.t() inside F.linear is a contiguous [K, N]. The original
+    tensor is freed on assignment, so no extra device memory is held.
+    """
+    if _rl_os.environ.get("H3_GEMM_RELAYOUT", "0") != "1":
+        return 0
+    import torch as _t
+
+    if _h3_relayout_dlo_active(root):
+        print(f"[GEMM_RELAYOUT][{_rl_rank()}] skipped: DLO", file=_rl_sys.stderr, flush=True)
+        return 0
+
+    n = 0
+    off_device = 0
+    skipped_quant = 0
+    for mod in root.modules():
+        # Linear only: Embedding weights are also 2D, but they are read
+        # row-wise, so a column-major relayout would only make them slower.
+        if "Linear" not in type(mod).__name__:
+            continue
+        # A quantized quant_method owns this weight's layout and packing
+        # (fp8 blockwise scales, int4 packing): re-striding the raw storage
+        # under it corrupts the weight. Match by MRO class name: the class
+        # lives in vllm and importing it here would drag the GPU stack in.
+        qm = getattr(mod, "quant_method", None)
+        if qm is not None and not any(c.__name__ == "UnquantizedLinearMethod" for c in type(qm).__mro__):
+            skipped_quant += 1
+            continue
+        w = getattr(mod, "weight", None)
+        if not isinstance(w, _t.nn.Parameter) or w.data.dim() != 2:
+            continue
+        d = w.data
+        # On the DLO mmap path the weights are still on CPU at
+        # post_load_weights time: a relayout would be overwritten by the copy
+        # that follows the *source* stride, so skip per tensor and count.
+        if d.device.type != "xpu":
+            off_device += 1
+            continue
+        if d.stride(0) == 1:  # already transpose-contiguous; post_load_weights is re-entered, stay idempotent
+            continue
+        mod.weight.data = d.t().contiguous().t()
+        n += 1
+    if n:
+        print(
+            f"[GEMM_RELAYOUT][{_rl_rank()}] {n} linear weights -> transpose-contiguous skipped_quant={skipped_quant}",
+            file=_rl_sys.stderr,
+            flush=True,
+        )
+    elif off_device:
+        print(
+            f"[GEMM_RELAYOUT][{_rl_rank()}] skipped: {off_device} weights not on device skipped_quant={skipped_quant}",
+            file=_rl_sys.stderr,
+            flush=True,
+        )
+    elif skipped_quant:
+        print(
+            f"[GEMM_RELAYOUT][{_rl_rank()}] skipped: quantized linears left to their "
+            f"quant_method skipped_quant={skipped_quant}",
+            file=_rl_sys.stderr,
+            flush=True,
+        )
+    return n
+
+
+# Hooked after the DiT's post_load_weights: run the original function's fp32
+# check first, then relayout. The regular path is called from
+# pipeline_minimax_h3.py; the host-weight restore path re-enters as well, and
+# the stride(0) == 1 early-exit above keeps this idempotent.
+try:
+    _rl_cls = MiniMaxH3DiTModel  # noqa: F821  -- defined earlier in this module
+    _rl_orig_plw = _rl_cls.post_load_weights
+
+    def _rl_post_load_weights(self, *a, **kw):
+        _out = _rl_orig_plw(self, *a, **kw)
+        try:
+            _h3_relayout_linear_weights(self)
+        except Exception as _e:  # a failed layout optimization must never break loading
+            print(f"[GEMM_RELAYOUT][{_rl_rank()}] skipped ({_e!r})", file=_rl_sys.stderr, flush=True)
+        return _out
+
+    _rl_cls.post_load_weights = _rl_post_load_weights
+except Exception as _e:
+    print(
+        f"[GEMM_RELAYOUT][{_rl_rank()}] could not install, "
+        f"keeping original behavior: {_e!r}",
+        file=_rl_sys.stderr,
+        flush=True,
+    )
+# ---- end gemm_relayout ----

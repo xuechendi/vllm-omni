@@ -171,7 +171,13 @@ from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _load_component_config, _VideoVAEPartProxy
+from .vae import (
+    MiniMaxH3AudioVAE,
+    MiniMaxH3VideoVAE,
+    _load_component_config,
+    _VideoVAEPartProxy,
+    vae_compile_allowed,
+)
 from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
@@ -1126,6 +1132,10 @@ class MiniMaxH3Pipeline(
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
+                allow_decoder_compile=vae_compile_allowed(
+                    bool(od_config.enforce_eager),
+                    current_omni_platform,
+                ),
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),

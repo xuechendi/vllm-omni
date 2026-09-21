@@ -33,15 +33,30 @@ class _FakeCheckpointModel:
         self.decoded_with = []
 
     def split_tiles(self, input_len, is_decoder=False):
-        """Same grid arithmetic as the checkpoint, on pixel dimensions."""
+        """Same grid arithmetic as the checkpoint, on pixel dimensions.
+
+        Returns per-tile pixel starts, per-tile lengths (all ``tile``) and the
+        overlaps, with the remainder distributed into the overlaps in
+        ``vae_ratio`` units -- exactly the checkpoint's ``split_tiles``, so the
+        uniformity predicate sees real starts, not indices.
+        """
         tile = TILE_SIZE if is_decoder else ENCODER_TILE_SIZE
         overlap = OVERLAP if is_decoder else ENCODER_OVERLAP
         if tile >= input_len:
             return [0], [input_len], []
         n = -(-input_len // tile)
-        while tile * n - overlap * (n - 1) - input_len < 0:
+        while True:
+            overlaps = [overlap] * (n - 1)
+            remaining = tile * n - sum(overlaps) - input_len
+            if remaining >= 0:
+                break
             n += 1
-        return list(range(n)), [tile] * n, [overlap] * (n - 1)
+        for i in range(remaining // self.vae_ratio):
+            overlaps[i % (n - 1)] += self.vae_ratio
+        starts = [0]
+        for i in range(n - 1):
+            starts.append(starts[-1] + tile - overlaps[i])
+        return starts, [tile] * n, overlaps
 
 
 def _vae(parallel_size, state):
@@ -87,6 +102,35 @@ def test_tile_count_uses_the_decoder_grid_not_the_encoder_one(h, w, decoder_tile
     px_h, px_w = h * RATIO, w * RATIO
     as_encoder = len(vae.model.split_tiles(px_h, False)[0]) * len(vae.model.split_tiles(px_w, False)[0])
     assert as_encoder == encoder_tiles != decoder_tiles
+
+
+@pytest.mark.parametrize(
+    ("h", "w"),
+    [
+        (16, 16),  # single tile
+        (24, 16),  # 2 tiles
+        (48, 84),  # the shipped 768x1344 request, 28 tiles
+        (96, 168),  # 1536x2688, 112 tiles
+    ],
+)
+def test_shipped_grids_resolve_as_equal_shape(h, w):
+    """With the checkpoint's tile parameters (multiples of vae_ratio) the
+    remainder is fully absorbed into the overlaps, so every tile keeps the full
+    tile length: the geometry proves an equal-shape grid and the decoder keeps
+    the persistent equal-shape gather on these canonical requests."""
+    assert MiniMaxH3VideoVAE._decoder_tile_grid_uniform(_vae(1, {}), _latent(h, w)) is True
+
+
+def test_a_grid_with_a_clipped_edge_tile_is_not_equal_shape():
+    """If the last tile's span runs past the axis, slicing clips it shorter:
+    the geometry must report a non-uniform grid so every rank takes the
+    checkpoint's variable-shape gather together."""
+    vae = _vae(1, {})
+    vae.model = types.SimpleNamespace(
+        vae_ratio=1,
+        split_tiles=lambda input_len, is_decoder: ([0, 6], [8, 8], [2]),
+    )
+    assert MiniMaxH3VideoVAE._decoder_tile_grid_uniform(vae, _latent(10, 10)) is False
 
 
 def test_rank_local_tiling_restores_the_group_state():

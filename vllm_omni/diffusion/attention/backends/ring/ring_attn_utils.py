@@ -98,6 +98,7 @@ def select_xpu_ring_attn_kwargs(
     joint_key, joint_value = None, None
     joint_strategy = "front"
     precision = None
+    valid_kv_length = None
     if attn_metadata is not None:
         joint_key = attn_metadata.joint_key
         joint_value = attn_metadata.joint_value
@@ -105,6 +106,7 @@ def select_xpu_ring_attn_kwargs(
             joint_strategy = attn_metadata.joint_strategy
         if attn_metadata.extra.get("kv_cache_dtype") == SYCL_TLA_FP8_LABEL:
             precision = "fp8_pertensor"
+        valid_kv_length = attn_metadata.extra.get("valid_kv_length")
 
     kwargs: dict[str, Any] = {
         "attn_type": attn_type,
@@ -124,7 +126,13 @@ def select_xpu_ring_attn_kwargs(
 
     if attn_type == AttnType.SYCL_TLA:
         valid_kv_lens = None
-        if orig_seq_len is not None and padding_size > 0:
+        if valid_kv_length is not None:
+            # Same source as the FA/SDPA ring paths in RingParallelAttention: the
+            # model's packed-sequence valid prefix published in attn_metadata takes
+            # precedence, so both ring implementations trim the circulated K/V
+            # blocks from one and the same global valid length.
+            valid_kv_lens = _valid_kv_lens_from_padding(valid_kv_length, key.shape[1], sp_group.ring_world_size)
+        elif orig_seq_len is not None and padding_size > 0:
             valid_kv_lens = _valid_kv_lens_from_padding(orig_seq_len, key.shape[1], sp_group.ring_world_size)
         kwargs["sycl_tla_precision"] = precision
         kwargs["valid_kv_lens"] = valid_kv_lens
@@ -139,5 +147,14 @@ def select_xpu_ring_attn_kwargs(
             f"(sp_padding_size={padding_size}); it has no way to mask the padded K/V. "
             "Use a sequence length divisible by the ring degree."
         )
+    if valid_kv_length is not None:
+        total_kv_len = key.shape[1] * sp_group.ring_world_size
+        if valid_kv_length < total_kv_len:
+            raise ValueError(
+                f"{_RING_ATTN_TYPE_ENV}={attn_type.value} cannot honor the model's packed valid prefix "
+                f"(valid_kv_length={valid_kv_length} < global K/V length {total_kv_len}); this kernel "
+                "takes no valid_kv_lens and would attend to the packed suffix padding as content. "
+                "Use sycl_tla, or drop the packed padding before the ring."
+            )
     logger.info_once("Ring attention block kernel: deepklox SageAttention V3 Hybrid (MXFP4 QK^T + MXFP8 E4M3 PV)")
     return kwargs

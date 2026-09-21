@@ -5,6 +5,7 @@
 
 
 import os
+import sys
 
 import torch
 from vllm.logger import init_logger
@@ -20,6 +21,40 @@ from vllm_omni.diffusion.distributed.comm import RingComm
 
 
 logger = init_logger(__name__)
+
+
+_RING_RESOLVED_SEEN: set[str] = set()
+
+
+def _ring_resolved_selfproof(process_group, precision) -> None:
+    """Per-process stderr self-evidence that THIS rank resolved the SYCL/TLA ring path.
+
+    Not a log call on purpose: logger.info_once at this site only ever reaches rank 0, so a
+    per-rank acceptance gate has no evidence for ranks 1..N-1 and cannot tell "all ranks
+    resolved sycl_tla" from "rank 0 did and nobody else". stderr bypasses per-rank logger
+    configuration; the dedup set is per PROCESS so counting distinct pids == world size is a
+    meaningful check.
+
+    Carries the resolved VALUES, not just its own existence. If the rank is
+    unobtainable it prints UNKNOWN rather than omitting the field -- a missing field would read
+    as "nothing to report" to whoever greps this line.
+    """
+    try:
+        rank = torch.distributed.get_rank(process_group)
+        world = torch.distributed.get_world_size(process_group)
+    except Exception:  # not initialised, or no such group: say so, do not drop the line
+        rank, world = "UNKNOWN", "UNKNOWN"
+    key = f"{rank}/{world}/{precision}"
+    if key in _RING_RESOLVED_SEEN:
+        return
+    _RING_RESOLVED_SEEN.add(key)
+    print(
+        f"[RING_RESOLVED][rank{rank} pid={os.getpid()}] "
+        f"attn_type=sycl_tla precision={precision} world={world}",
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 _RING_ATTN_TYPE_ENV = "VLLM_OMNI_RING_ATTN_TYPE"
 
@@ -97,6 +132,28 @@ def ring_flash_attn_forward(
         if not HAS_SYCL_TLA_RING_ATTN or q.device.type != "xpu":
             raise RuntimeError("SYCL/TLA IPC ring attention requires its extension and an XPU input")
         logger.info_once("SYCL/TLA IPC ring attention is enabled with precision=%s.", sycl_tla_precision)
+        _ring_resolved_selfproof(process_group, sycl_tla_precision)
+        if valid_kv_length is not None:
+            # This entry point documents the model-facing global valid_kv_length,
+            # so it must honor it with the same math as the selector path
+            # (select_xpu_ring_attn_kwargs) instead of silently dropping it and
+            # letting the kernel attend to the packed suffix padding.
+            from vllm_omni.diffusion.attention.backends.ring.ring_attn_utils import (
+                _valid_kv_lens_from_padding,
+            )
+
+            derived_kv_lens = _valid_kv_lens_from_padding(
+                valid_kv_length, k.shape[1], torch.distributed.get_world_size(process_group)
+            )
+            if valid_kv_lens is None:
+                valid_kv_lens = derived_kv_lens
+            elif list(valid_kv_lens) != derived_kv_lens:
+                raise ValueError(
+                    "valid_kv_lens and valid_kv_length disagree: "
+                    f"valid_kv_lens={list(valid_kv_lens)} but valid_kv_length={valid_kv_length} "
+                    f"derives {derived_kv_lens} for K/V block length {k.shape[1]}. "
+                    "Pass only one of them, or make them consistent."
+                )
         return sycl_tla_ring_attn_forward(
             process_group=process_group,
             q=q,
