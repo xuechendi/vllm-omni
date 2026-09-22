@@ -11,6 +11,9 @@
 #   TASK=ref2va CARDS=4 REF_IMAGE=/workspace/h3_in/cat.png bash minimax_h3_va_xpu.sh
 #   STEPS=4 WARM_STEPS=0 REPS=1 bash minimax_h3_va_xpu.sh    # functional smoke, NOT a perf number
 #   KEEP_SERVER=1 bash minimax_h3_va_xpu.sh                  # leave the server up for more curls
+#   CACHE=1 bash minimax_h3_va_xpu.sh                        # cache_dit denoise loop
+#   CACHE=1 QUANT=mxfp8 ATTN=SAGE_ATTN_3 bash minimax_h3_va_xpu.sh          # 1 card
+#   CACHE=1 QUANT=mxfp8 KV_DTYPE=fp8_sycl_tla CARDS=4 bash minimax_h3_va_xpu.sh
 #
 # The defaults ARE the reference measurement profile, so a bare invocation is
 # directly comparable to the recorded numbers below: 1248x768, 141 frames,
@@ -51,7 +54,9 @@
 #   CARDS=1   DLO with --dlo-resident-layers 50, i.e. all 50 DiT blocks resident
 #             (DLO still owns the weights, which is why H3_GEMM_RELAYOUT declines
 #             them -- see the relayout note below), ring degree 1, attention =
-#             vllm-xpu-kernels bf16 FA.
+#             vllm-xpu-kernels bf16 FA. DLO is skipped automatically when QUANT is
+#             set, since quantized weights do not need it and DLO owning them
+#             changes a second variable; see the DLO= note at that branch.
 #   CARDS=N   TP1 / Ulysses 1 / ring = N, text encoder tp = N, VAE patch
 #             parallel = N with tiled decode, no DLO.
 #
@@ -63,8 +68,11 @@
 # both at once unless the host has RAM for two copies.
 #
 # Do NOT pass --enforce-eager (it is in the CUDA consumer-GPU recipes, not this
-# one) and keep --cache-backend none: this is the uncached reference path, so the
-# numbers it prints are comparable to the 50-step cells in the doc above.
+# one). The default is --cache-backend none, the uncached reference path, which is
+# what makes the numbers comparable to the 50-step cells above; CACHE=1 switches
+# to cache_dit and is a different measurement, not a faster version of the same
+# one -- it skips block recomputation, so it trades quality for speed and has to
+# be validated on output, not only timed.
 set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=${REPO:-$(cd "$HERE/../.." && pwd)}
@@ -118,6 +126,69 @@ fi
 # 76-79 s against a 212-222 s timed one, so it is cheap insurance).
 REPS=${REPS:-2}
 WARM_STEPS=${WARM_STEPS:-4}
+# CACHE=1 switches the denoise loop from the uncached reference path to the
+# cache_dit backend, which skips recomputing transformer blocks on steps whose
+# residual moves less than residual_diff_threshold. It is a speed/quality trade,
+# not a free win, so it is off by default and its number is NOT comparable to the
+# recorded cells -- the reference line at the bottom is suppressed when it is on.
+# The config below is the one the reference harness uses: 1 front block always
+# computed, no back blocks, the first 4 steps never cached (they set the residual
+# baseline), at most 4 consecutive cached steps, TaylorSeer extrapolation off.
+CACHE=${CACHE:-0}
+case "$CACHE" in 0|1) ;; *) echo "[h3] CACHE must be 0 or 1, got '$CACHE'"; exit 2 ;; esac
+CACHE_CFG=${CACHE_CFG:-'{"Fn_compute_blocks":1,"Bn_compute_blocks":0,"max_warmup_steps":4,"residual_diff_threshold":0.24,"max_continuous_cached_steps":4,"enable_taylorseer":false,"taylorseer_order":1,"scm_steps_mask_policy":null,"scm_steps_policy":"dynamic"}'}
+# The JSON is passed as one argv element, so a single quote inside it would break
+# the quoting rather than be rejected by the JSON parser -- refuse it up front.
+case "$CACHE_CFG" in *"'"*) echo "[h3] CACHE_CFG must not contain a single quote"; exit 2 ;; esac
+
+# ---- precision knobs --------------------------------------------------------
+# Three INDEPENDENT axes, kept as three variables rather than one "fp8 preset",
+# because they quantize different tensors, are served by different kernels, and
+# can each be wrong on its own. All are empty by default: every recorded cell
+# above is bf16 weights, bf16 activations and a bf16 ring.
+#
+#   QUANT     W8A8 linear quantization of the DiT, via
+#             --diffusion-quantization-config. A bare name expands to
+#             '{"method":"<name>"}', or pass full JSON. On XPU only the ONLINE
+#             (dynamic) path exists: mxfp8_config.py raises NotImplementedError
+#             for a pre-quantized checkpoint, so weights are cast at load from the
+#             bf16 safetensors and activation scales come from a per-call amax.
+#             That means QUANT=mxfp8 needs no second checkpoint -- and also that
+#             it cannot be compared against an offline-quantized number from a
+#             CUDA or NPU run. It binds the DiT's vLLM LinearBase layers
+#             (Column/Row/QKV/MergedColumn); the 6 plain nn.Linear stay bf16.
+#   KV_DTYPE  attention K/V transport, via --diffusion-kv-cache-dtype:
+#             fp8 | fp8_sycl_tla | mxfp8_sycl_tla. On the N-card ring this is the
+#             only thing that makes the circulated K/V blocks fp8 --
+#             ring_attn_utils.py turns fp8_sycl_tla into precision="fp8_pertensor"
+#             for the SYCL/TLA block kernel, and leaves it bf16 otherwise.
+#             VLLM_OMNI_RING_ATTN_PRECISION does NOT do this; it is inert here.
+#   ATTN      --diffusion-attention-backend, e.g. SAGE_ATTN_3 for the deepklox
+#             SageAttention V3 Hybrid kernel (MXFP4 E2M1 QK^T + MXFP8 E4M3 P/V).
+#             1-card axis: with CARDS>1 attention goes through the ring, whose
+#             block kernel is picked by VLLM_OMNI_RING_ATTN_TYPE
+#             (sycl_tla | klox_sage_v3_hybrid), not by this flag. The sage3
+#             backend also has a flash fallback for calls the kernel declines
+#             (GQA, non-128 head size, contract rejections), so "SAGE_ATTN_3 was
+#             selected" is not "every call ran the sage kernel" -- the call counts
+#             printed at server exit are what distinguishes them.
+QUANT=${QUANT:-}
+KV_DTYPE=${KV_DTYPE:-}
+ATTN=${ATTN:-}
+QUANT_CFG=
+if [ -n "$QUANT" ]; then
+    case "$QUANT" in
+        "{"*) QUANT_CFG=$QUANT ;;
+        *) QUANT_CFG="{\"method\":\"$QUANT\"}" ;;
+    esac
+    case "$QUANT_CFG" in *"'"*) echo "[h3] QUANT must not contain a single quote"; exit 2 ;; esac
+fi
+# Reject an unknown K/V label here rather than at the first attention call, which
+# is minutes of weight load away.
+case "$KV_DTYPE" in
+    ''|fp8|fp8_sycl_tla|mxfp8_sycl_tla) ;;
+    *) echo "[h3] KV_DTYPE must be empty, fp8, fp8_sycl_tla or mxfp8_sycl_tla, got '$KV_DTYPE'"; exit 2 ;;
+esac
 # Where the checkpoint is depends on which side of the container mount you are on,
 # so try the known roots in order and let MODEL_ROOT= override. The download lives
 # at /mnt/disk2/models/MiniMax-H3 on this host; /mnt/disk2/models is NOT mounted
@@ -252,7 +323,10 @@ fi
 OUT_DIR=${OUT_DIR:-/workspace/minimax_h3_logs}
 mkdir -p "$OUT_DIR" 2>/dev/null || OUT_DIR=$HERE/logs
 mkdir -p "$OUT_DIR"
-TAG=${TAG:-${TASK}_${CARDS}c_${STEPS}step}
+# Every knob that changes the arithmetic goes in the tag, so a quantized run
+# cannot overwrite the bf16 one it is being compared against -- the outputs are
+# MP4s in a shared directory and the whole point of these runs is the A/B.
+TAG=${TAG:-${TASK}_${CARDS}c_${STEPS}step$( [ "$CACHE" = 1 ] && echo _cd1 )$( [ -n "$QUANT" ] && echo "_q$QUANT" )$( [ -n "$KV_DTYPE" ] && echo "_kv$KV_DTYPE" )$( [ -n "$ATTN" ] && echo "_$(echo "$ATTN" | tr 'A-Z_' 'a-z-')" )}
 LOG=$OUT_DIR/$TAG.log; OUT=$OUT_DIR/$TAG.mp4
 
 # ---- environment ------------------------------------------------------------
@@ -311,25 +385,68 @@ export NO_PROXY=${NO_PROXY:-0.0.0.0,127.0.0.1,localhost}
 
 SERVE_ARGS=(
     --omni --host 0.0.0.0 --port "$PORT" --trust-remote-code
-    --task-type "$TASK_TYPE" --dtype bfloat16 --cache-backend none
+    --task-type "$TASK_TYPE" --dtype bfloat16
     --num-gpus "$CARDS" --tensor-parallel-size 1 --usp 1
     --vae-parallel-mode tile --vae-use-tiling
     --init-timeout 1800 --stage-init-timeout 1500
 )
+if [ "$CACHE" = 1 ]; then
+    SERVE_ARGS+=(--cache-backend cache_dit --cache-config "$CACHE_CFG")
+else
+    SERVE_ARGS+=(--cache-backend none)
+fi
+[ -n "$QUANT_CFG" ] && SERVE_ARGS+=(--diffusion-quantization-config "$QUANT_CFG")
+[ -n "$KV_DTYPE" ] && SERVE_ARGS+=(--diffusion-kv-cache-dtype "$KV_DTYPE")
+if [ -n "$ATTN" ]; then
+    SERVE_ARGS+=(--diffusion-attention-backend "$ATTN")
+    # The sage3 backend counts, per kind, which calls the V3 kernel served and
+    # which its flash/SDPA fallback did -- and only when this is on. Without it
+    # the run cannot tell "sage ran everywhere" from "sage declined every call
+    # and flash quietly produced the number", which is the one thing a
+    # sage-vs-bf16 comparison has to establish. The counters are a dict increment
+    # per call, and the report is printed at server exit, so it lands at the tail
+    # of $LOG after the teardown below -- not in the evidence section.
+    case "$ATTN" in SAGE_ATTN_3|SAGE_ATTN) export SAGE_ATTN_REPORT_FALLBACKS=${SAGE_ATTN_REPORT_FALLBACKS:-1} ;; esac
+fi
 # Per-stage timings. The curl wall time conflates denoise with VAE decode, and for
 # H3 those two scale differently across cards (the ring speeds up the DiT; the
 # decode is tiled patch-parallel), so a 1-card vs N-card comparison built on wall
 # time alone attributes the difference to the wrong stage. PROFILER=0 to drop it.
 [ "${PROFILER:-1}" = 1 ] && SERVE_ARGS+=(--enable-diffusion-pipeline-profiler)
 if [ "$CARDS" = 1 ]; then
-    # Fully resident: DLO keeps the rank-local shard in pinned host memory and
-    # with resident=50 every block is copied to the card once per denoise stage
-    # instead of streamed through the two-buffer window. --dlo-no-use-allgather
-    # keeps each worker on its own standard-loader shard (no DP AllGather to
-    # reconstruct full blocks), which is what makes a 1-card run meaningful.
-    SERVE_ARGS+=(--text-encoder-tp-size 1 --vae-patch-parallel-size 1
-                 --enable-distributed-layerwise-offload --dlo-no-use-allgather
-                 --dlo-resident-layers 50)
+    SERVE_ARGS+=(--text-encoder-tp-size 1 --vae-patch-parallel-size 1)
+    # DLO is the bf16 1-card shape and is OFF whenever the DiT is quantized.
+    #
+    # With --dlo-resident-layers 50 == num_layers, DLO streams nothing per step;
+    # its job on 1 card is purely to get 50 bf16 blocks onto the card at all.
+    # Quantized weights are about half the bytes, so that job is gone -- and DLO
+    # owning the weights actively gets in the way: it keeps its own host-side
+    # copies and moves the module between host and device around load, which is
+    # what produces the "Stream-offloaded 0 online-quantized layers to CPU" and
+    # "Quantization complete, offloaded model back to CPU" pair, and it is also
+    # why H3_GEMM_RELAYOUT declines DLO-owned weights. Leaving it on would mean
+    # the quantized row differs from the bf16 one in two ways at once.
+    #
+    # Consequence to state whenever the 1-card rows are compared: a QUANT row and
+    # the 889.96 s bf16 cell do NOT differ only in arithmetic -- one has DLO and
+    # the other does not. DLO=1 forces it back on, DLO=0 off.
+    DLO=${DLO:-auto}
+    case "$DLO" in
+        auto) _dlo=$( [ -n "$QUANT" ] && echo 0 || echo 1 ) ;;
+        0|1) _dlo=$DLO ;;
+        *) echo "[h3] DLO must be auto, 0 or 1, got '$DLO'"; exit 2 ;;
+    esac
+    if [ "$_dlo" = 1 ]; then
+        # Fully resident: DLO keeps the rank-local shard in pinned host memory and
+        # with resident=50 every block is copied to the card once per denoise stage
+        # instead of streamed through the two-buffer window. --dlo-no-use-allgather
+        # keeps each worker on its own standard-loader shard (no DP AllGather to
+        # reconstruct full blocks), which is what makes a 1-card run meaningful.
+        SERVE_ARGS+=(--enable-distributed-layerwise-offload --dlo-no-use-allgather
+                     --dlo-resident-layers 50)
+    else
+        echo "[h3] DLO off on 1 card ($( [ -n "$QUANT" ] && echo "QUANT=$QUANT" || echo "DLO=$DLO" )): weights stay where the loader puts them, no layerwise offload"
+    fi
 else
     # Ring degree N == world size N. sycl_tla is also what the in-tree autoselect
     # picks on XPU when the extension is built, but pinning it means a build
@@ -353,7 +470,14 @@ else
 fi
 
 echo "[h3] task=$TASK partition=$PART model=$MODEL"
-echo "[h3] cards=$CARDS mask=$MASK steps=$STEPS seed=$SEED reps=$REPS warm_steps=$WARM_STEPS"
+echo "[h3] cards=$CARDS mask=$MASK steps=$STEPS seed=$SEED reps=$REPS warm_steps=$WARM_STEPS cache=$( [ "$CACHE" = 1 ] && echo "cache_dit" || echo none )"
+[ "$CACHE" = 1 ] && echo "[h3] cache_config=$CACHE_CFG"
+echo "[h3] precision: linear=${QUANT_CFG:-bf16} kv=${KV_DTYPE:-bf16} attn_backend=${ATTN:-platform-default}$( [ "$CARDS" != 1 ] && echo " ring=${VLLM_OMNI_RING_ATTN_TYPE:-sycl_tla}" )"
+# --diffusion-attention-backend does not reach the ring block kernel, so on N
+# cards it would look set and change nothing about the DiT self-attention. Say so
+# instead of letting the tag claim a kernel that never ran.
+[ -n "$ATTN" ] && [ "$CARDS" != 1 ] && \
+    echo "[h3] WARNING: CARDS=$CARDS -- DiT self-attention goes through the ring, whose kernel is VLLM_OMNI_RING_ATTN_TYPE, not ATTN=$ATTN"
 echo "[h3] shape: ${WIDTH:-default}x${HEIGHT:-default} $( [ -n "$FRAMES" ] && echo "frames=$FRAMES" || echo "duration=${DURATION}s" ) fps=$FPS prompt=${PROMPT_FILE:-inline}"
 echo "[h3] log=$LOG out=$OUT"
 
@@ -475,7 +599,8 @@ printf '[h3] %s\n' "${XINF_TABLE[@]}"
 # Name the cell this run is comparable to, but only when the shape really is the
 # recorded one -- a reference line printed next to a number measured at some other
 # shape is worse than no reference line at all.
-if [ "$TASK" = t2va ] && [ "$STEPS" = 50 ] && [ "$FRAMES" = 141 ] && \
+if [ "$TASK" = t2va ] && [ "$STEPS" = 50 ] && [ "$FRAMES" = 141 ] && [ "$CACHE" = 0 ] && \
+   [ -z "$QUANT" ] && [ -z "$KV_DTYPE" ] && [ -z "$ATTN" ] && \
    [ "${WIDTH:-1248}" = 1248 ] && [ "${HEIGHT:-768}" = 768 ]; then
     case "$CARDS" in
         1) echo "[h3] reference: 889.96 s / peak 76846 MB (hq-cri-d93-a, h3port/cri:b98ebcc2-mkstack)" ;;
@@ -492,6 +617,16 @@ FLAT=$OUT_DIR/$TAG.flat.log
 tr '\r' '\n' < "$LOG" > "$FLAT"
 grep -aE '\[GEMM_RELAYOUT\]|\[RING_RESOLVED\]|\[XPU_PREFIX_KV\]|\[H3_VAE_[A-Z_0-9]+\]' "$FLAT" | tail -20
 grep -aE 'ring attention is enabled|falling back to the original attention' "$FLAT" | tail -5
+# One line per precision knob, each of which can silently not take effect:
+# quantization can be auto-detected off or overridden, the attention backend can
+# resolve to the platform default, and the sage3 kernel can decline every call.
+grep -aE 'Building quantization config|Auto-detected quantization|Resolved diffusion attention backend|SageAttention3 XPU|Ring attention block kernel' "$FLAT" | sort -u | tail -10
+if [ -n "$QUANT" ] && ! grep -aq 'Building quantization config' "$FLAT"; then
+    echo "[h3] WARNING: no 'Building quantization config' line -- QUANT=$QUANT may not have been applied"
+fi
+if [ -n "$ATTN" ] && ! grep -aq "Resolved diffusion attention backend '$ATTN'" "$FLAT"; then
+    echo "[h3] WARNING: backend '$ATTN' never resolved -- check for the deepklox import warning above"
+fi
 if [ "$CARDS" != 1 ] && ! grep -aq '\[RING_RESOLVED\]' "$FLAT"; then
     echo "[h3] WARNING: no [RING_RESOLVED] line -- the SYCL/TLA ring never resolved, so this is not a ring$CARDS result"
 fi
