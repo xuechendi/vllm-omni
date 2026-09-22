@@ -7,6 +7,7 @@
 #   bash hy_image3_ar_dit_mxfp8weight.sh                 # both t2i cases
 #   CASES=recaption bash hy_image3_ar_dit_mxfp8weight.sh
 #   ZE_AFFINITY_MASK=2,3 STEPS=50 bash hy_image3_ar_dit_mxfp8weight.sh
+#   VAE_CHANNELS_LAST=0 bash hy_image3_ar_dit_mxfp8weight.sh   # A/B the NCHW VAE decode
 #
 # it2i -- image + edit instruction, where the AR *looks at the image* through its
 # SigLIP2 tower before recaptioning -- is the other direction these two stages can
@@ -146,6 +147,21 @@ export VLLM_OMNI_STAGE_WEIGHTS=${STAGE_WEIGHTS:-1}
 # the 32 layers (~192 per-expert copies each, driven serially). Two stages of
 # that is well past the 3600s default.
 export VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_S:-7200}
+
+# VAE decode layout. Stage 1's decoder runs channels-last (NDHWC) by default on
+# XPU -- ~1.9x on vae.decode, already folded into the stage_1 ~7.7s above -- so
+# leaving this unset is the fast path and needs nothing set. The knob is the
+# HY3_VAE_DECODE_CHANNELS_LAST env flag that resolve_decode_channels_last() reads
+# (autoencoder.py): =1 pins the fast NDHWC path on regardless of platform, =0
+# A/Bs the old NCHW decode, unset keeps the platform default. Only export it when
+# VAE_CHANNELS_LAST is set, so an unset run leaves the env untouched.
+VAE_CHANNELS_LAST=${VAE_CHANNELS_LAST:-}
+case "$VAE_CHANNELS_LAST" in
+    1|true|on)   export HY3_VAE_DECODE_CHANNELS_LAST=1 ;;
+    0|false|off) export HY3_VAE_DECODE_CHANNELS_LAST=0 ;;
+    "")          ;;  # unset -> platform default (NDHWC on XPU)
+    *) echo "VAE_CHANNELS_LAST='$VAE_CHANNELS_LAST' unrecognized (want 1/0)"; exit 2 ;;
+esac
 
 # Validate before spending ten minutes on start-up.
 for c in $CASES; do

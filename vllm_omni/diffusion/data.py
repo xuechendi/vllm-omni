@@ -971,6 +971,10 @@ class OmniDiffusionConfig:
     # Independent encoder fast path for the residual, patchified Wan VAE used
     # by Cosmos3. Levels have the same numerical contract as the decoder.
     vae_encode_fast_path: str = "lossless"
+    # Run the VAE decoder's upsampling stack on channels-last (NDHWC) activations, where that
+    # is implemented (HunyuanImage-3.0). None leaves the choice to the model's own default,
+    # which is platform-dependent; True/False pin it for this deployment.
+    vae_decode_channels_last: bool | None = None
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None

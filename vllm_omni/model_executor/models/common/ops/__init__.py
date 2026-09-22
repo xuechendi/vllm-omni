@@ -4,6 +4,12 @@ This module contains fused operators that can be reused across multiple models
 and compiled for different hardware targets (CUDA, ROCm, etc.).
 """
 
+from vllm_omni.model_executor.models.common.ops.conv3d_as_conv2d import (
+    Conv3dChannelsLast,
+    conv3d_as_conv2d,
+    pixel_shuffle_channels_last,
+    to_channels_last_3d,
+)
 from vllm_omni.model_executor.models.common.ops.fused_adaptive_group_norm_silu import (
     fused_adaptive_group_norm_silu,
 )
@@ -14,4 +20,8 @@ from vllm_omni.model_executor.models.common.ops.fused_group_norm_silu import (
 __all__ = [
     "fused_group_norm_silu",
     "fused_adaptive_group_norm_silu",
+    "Conv3dChannelsLast",
+    "conv3d_as_conv2d",
+    "pixel_shuffle_channels_last",
+    "to_channels_last_3d",
 ]

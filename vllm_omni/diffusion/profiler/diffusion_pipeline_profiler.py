@@ -6,6 +6,7 @@ from threading import Lock
 from typing import Any
 
 import torch
+from torch.profiler import record_function
 from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
@@ -50,7 +51,19 @@ def profiler(name: str, func: Callable, instance: Any) -> Callable:
         _sync_if_useful()
         start_time = time.perf_counter()
         try:
-            return func(*args, **kwargs)
+            # Name the region in a torch/Kineto trace as well, so that a capture taken through
+            # /start_profile can be sliced per target ("which kernels ran inside vae.decode")
+            # instead of only totalled. record_function is host-side annotation: no device work,
+            # and no cost worth measuring when no profiler is running.
+            #
+            # The drain has to happen *inside* the range. These targets submit asynchronously --
+            # a 756 ms VAE decode returns to the host in 73 ms -- so a range that closes where
+            # the host call returns contains a tenth of the kernels it is supposed to explain.
+            # The sync below is the one the `finally` would do anyway, moved in.
+            with record_function(metric_name):
+                result = func(*args, **kwargs)
+                _sync_if_useful()
+            return result
         finally:
             _sync_if_useful()
             duration = time.perf_counter() - start_time

@@ -3,6 +3,7 @@
 
 import copy
 import logging
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -404,6 +405,9 @@ class HunyuanImage3Pipeline(
 
         self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
         self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
+        # None -- the default -- leaves the layout to the decoder itself (env, then platform);
+        # a deployment that wants it pinned either way sets vae_decode_channels_last.
+        self.vae.decode_channels_last = self.od_config.vae_decode_channels_last
         self._pipeline = None
         self._tkwrapper = TokenizerWrapper(od_config.model)
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
@@ -594,9 +598,24 @@ class HunyuanImage3Pipeline(
         # Note: guidance_emb and timestep_r_emb are no longer skipped
         # to support HunyuanImage-3.0-Distil and MeanFlow distilled models
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(
+        loaded = loader.load_weights(
             weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
+
+        # The VAE decoder's channels-last path costs a process ~3 s of Triton setup the first
+        # time it runs, plus a compile -- once per host, not per server -- for any of its kernels
+        # the host has never built. Unwarmed, all of it landed on the first request: 11.2 s
+        # against a 0.75 s steady state, and 23.8 s on a host meeting the kernels for the first
+        # time. It is shape-independent, so one throwaway decode at a tiny latent moves it off
+        # the first request. A no-op when the channels-last decoder is disabled.
+        try:
+            t0 = time.perf_counter()
+            self.vae.warmup_decode()
+            logger.info("HunyuanImage3: VAE decode warmup took %.2fs", time.perf_counter() - t0)
+        except Exception as exc:  # a failed warmup must not take the server down with it
+            logger.warning("HunyuanImage3: VAE decode warmup failed (%s); first decode will be slow", exc)
+
+        return loaded
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed
