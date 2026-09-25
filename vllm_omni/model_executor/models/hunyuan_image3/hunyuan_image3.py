@@ -1618,6 +1618,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     # _vit_encode_dp.
     supports_encoder_tp_data = True
 
+    # The downstream HunyuanImage3 diffusion stage consumes generated token ids
+    # and text (see stage_input_processors.hunyuan_image3.ar2diffusion), not AR
+    # hidden states. Leaving this on costs a blocking 8 KB D2H per decode step,
+    # which also acts as a host/device barrier.
+    omni_pooler_payload_include_hidden = False
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
