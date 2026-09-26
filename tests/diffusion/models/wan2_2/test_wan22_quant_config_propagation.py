@@ -248,65 +248,72 @@ class TestPatchWanRmsNorm:
 
 
 class TestI2VTransformer2QuantConfig:
-    """Test the transformer_2 quant_config build logic from pipeline_wan2_2_i2v."""
+    """transformer_2 (low-noise expert) quant config in pipeline_wan2_2_i2v."""
 
-    def test_transformer_2_quant_config_built_from_dict(self):
-        """When transformer_2 config has quantization_config dict, build_quant_config is called."""
-        from vllm_omni.quantization.factory import build_quant_config
+    @staticmethod
+    def _build_t2(mocker: MockerFixture, active, t1_config: dict, t2_config: dict):
+        from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import Wan22I2VPipeline
 
-        t2_config = {
-            "patch_size": [1, 2, 2],
-            "num_layers": 2,
-            "quantization_config": {
-                "quant_method": "auto-round",
-                "bits": 4,
-                "group_size": 128,
-                "sym": True,
-                "packing_format": "auto_round:auto_gptq",
-            },
-        }
+        captured = {}
 
-        # Replicate the logic from pipeline_wan2_2_i2v.py
-        t2_quant = t2_config.get("quantization_config")
-        if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-            method = t2_quant["quant_method"]
-            kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
-            t2_quant = build_quant_config(method, **kwargs)
-        else:
-            t2_quant = None
+        class FakeTransformer:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
 
+        mocker.patch.object(wan22_module, "WanTransformer3DModel", FakeTransformer)
+        # An active config auto-detected from transformer/config.json is startup metadata about
+        # the first expert, not a user policy for both, which is exactly the case t1_config
+        # carrying a quantization_config stands for here.
+        pipeline = SimpleNamespace(
+            od_config=SimpleNamespace(
+                quantization_config=active,
+                quantization_config_is_auto_detected="quantization_config" in t1_config,
+            )
+        )
+        Wan22I2VPipeline._create_transformer(pipeline, t2_config, component="transformer_2")
+        return captured.get("quant_config")
+
+    def test_online_quant_reaches_bf16_transformer_2(self, mocker: MockerFixture):
+        """--quantization on a BF16 checkpoint must quantize both experts, not just transformer."""
+        from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+        online = DiffusionMXFP8Config()
+        qc = self._build_t2(mocker, online, {"patch_size": [1, 2, 2]}, {"patch_size": [1, 2, 2]})
+        assert qc is online
+
+    def test_no_quant_leaves_transformer_2_bf16(self, mocker: MockerFixture):
+        qc = self._build_t2(mocker, None, {"patch_size": [1, 2, 2]}, {"patch_size": [1, 2, 2]})
+        assert qc is None
+
+    def test_quant_auto_detected_from_transformer_not_applied_to_bf16_transformer_2(self, mocker: MockerFixture):
+        """The active config came from transformer/config.json; transformer_2 has none, so it stays BF16."""
+        from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+        disk_qc = {"quant_method": "mxfp8", "is_checkpoint_mxfp8_serialized": True}
+        active = DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True)
+        qc = self._build_t2(
+            mocker, active, {"patch_size": [1, 2, 2], "quantization_config": disk_qc}, {"patch_size": [1, 2, 2]}
+        )
+        assert qc is None
+
+    def test_transformer_2_detects_its_own_disk_config(self, mocker: MockerFixture):
+        """Both experts pre-quantized: transformer_2 builds from its own config.json (AutoRound W4A16)."""
         from vllm.model_executor.layers.quantization.inc import INCConfig
 
-        assert isinstance(t2_quant, INCConfig)
-        assert t2_quant.weight_bits == 4
-        assert t2_quant.group_size == 128
-
-    def test_transformer_2_quant_config_none_when_missing(self):
-        """When transformer_2 config has no quantization_config, result is None."""
-        t2_config = {
-            "patch_size": [1, 2, 2],
-            "num_layers": 2,
+        disk_qc = {
+            "quant_method": "auto-round",
+            "bits": 4,
+            "group_size": 128,
+            "sym": True,
+            "packing_format": "auto_round:auto_gptq",
         }
-
-        t2_quant = t2_config.get("quantization_config")
-        if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-            pass  # won't enter
-        else:
-            t2_quant = None
-
-        assert t2_quant is None
-
-    def test_transformer_2_quant_config_none_when_dict_lacks_method(self):
-        """When quantization_config is a dict but missing quant_method, result is None."""
-        t2_config = {
-            "patch_size": [1, 2, 2],
-            "quantization_config": {"bits": 4},  # no quant_method key
-        }
-
-        t2_quant = t2_config.get("quantization_config")
-        if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-            pass
-        else:
-            t2_quant = None
-
-        assert t2_quant is None
+        active = mocker.MagicMock()
+        qc = self._build_t2(
+            mocker,
+            active,
+            {"patch_size": [1, 2, 2], "quantization_config": disk_qc},
+            {"patch_size": [1, 2, 2], "quantization_config": disk_qc},
+        )
+        assert isinstance(qc, INCConfig)
+        assert qc.weight_bits == 4
+        assert qc.group_size == 128
