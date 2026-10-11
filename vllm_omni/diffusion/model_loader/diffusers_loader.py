@@ -422,6 +422,13 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         prefixed_weights_iterator = ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        # OMNI_PIN_WEIGHTS=1 stages every CPU weight through pinned memory before the H2D copy.
+        # Copying straight from pageable host memory hits engine CAT faults
+        # (-EPERM) and hung loads on some CRI nodes.
+        if os.environ.get("OMNI_PIN_WEIGHTS") == "1":
+            prefixed_weights_iterator = (
+                (n, t.pin_memory() if t.device.type == "cpu" else t) for (n, t) in prefixed_weights_iterator
+            )
         if model is not None:
             checkpoint_adapter = self._get_checkpoint_adapter(model, source, use_safetensors)
             if checkpoint_adapter is not None:
