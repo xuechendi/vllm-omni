@@ -234,9 +234,17 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 if self.is_checkpoint_mxfp4_serialized:
                     raise NotImplementedError("Pre-quantized MXFP4 checkpoints are not yet supported on ROCm.")
                 return ROCmMxfp4OnlineLinearMethod(self)
+            if current_omni_platform.is_xpu():
+                if self.mxfp4_scale_alg != 0 or self.w4a8_fallback_steps or self.w4a8_fallback_layers:
+                    raise NotImplementedError(
+                        "MXFP4 UOS scaling and W4A8 fallback are currently only supported on NPU (Ascend)."
+                    )
+                if self.is_checkpoint_mxfp4_serialized:
+                    return VllmMxfp4OfflineLinearMethod()
+                return VllmMxfp4OnlineLinearMethod()
             raise NotImplementedError(
                 "DiffusionMXFP4Config (W4A4 MXFP4) is currently only supported "
-                "on NPU (Ascend) and ROCm (AMD, gfx950) platforms."
+                "on NPU (Ascend), ROCm (AMD, gfx950) and XPU (Intel) platforms."
             )
         return None
 
@@ -1060,6 +1068,7 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
 try:
     from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
     from vllm.model_executor.kernels.linear.mxfp4.xpu import XPUMxFp4LinearKernel
+    from vllm.model_executor.layers.quantization.online.mxfp4 import Mxfp4OnlineLinearMethod
     from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
     from vllm.model_executor.parameter import GroupQuantScaleParameter
 except ImportError as e:
@@ -1150,6 +1159,26 @@ class VllmMxfp4OfflineLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if x.dim() <= 2:
             return self.kernel.apply_weights(layer, x, bias)
+        ori_shape = x.shape
+        output = self.kernel.apply_weights(layer, x.reshape(-1, ori_shape[-1]), bias)
+        return output.reshape(*ori_shape[:-1], -1)
+
+
+class VllmMxfp4OnlineLinearMethod(Mxfp4OnlineLinearMethod):
+    """Online MXFP4 linear method: BF16 checkpoint, quantized at load time.
+
+    vLLM's :class:`Mxfp4OnlineLinearMethod` as is -- meta-device weights, the
+    load-time quantization and the kernel relayout -- except that apply()
+    flattens activations to ``(M, K)`` like the offline method: DiT linears see
+    ``(B, S, K)``, while vLLM's LLM callers only ever pass 2-D.
+    """
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         ori_shape = x.shape
         output = self.kernel.apply_weights(layer, x.reshape(-1, ori_shape[-1]), bias)
         return output.reshape(*ori_shape[:-1], -1)
