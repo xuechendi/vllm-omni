@@ -64,7 +64,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import ModelWeightParameter
-from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.model_executor.utils import replace_parameter
 
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization._copy_missing_attrs import (
@@ -81,11 +81,6 @@ except ImportError:
     from vllm.model_executor.layers.quantization.fp8 import (  # type: ignore[attr-defined,no-redef]
         CopyNumelCounter as CopyCounter,
     )
-
-
-def copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
-    new_attrs = set(dir(new))
-    set_weight_attrs(new, {attr: getattr(old, attr) for attr in dir(old) if attr not in new_attrs})
 
 
 if TYPE_CHECKING:
@@ -188,7 +183,11 @@ class DiffusionMXFP8Config(QuantizationConfig):
             if current_omni_platform.is_xpu():
                 if self.is_checkpoint_mxfp8_serialized:
                     raise NotImplementedError(self._XPU_OFFLINE_UNSUPPORTED)
-                return VllmMxfp8OnlineMoEMethod(layer=layer)
+                # vLLM's own online MoE methods take the FusedMoEConfig, not the
+                # layer -- cf. Fp8PerTensorOnlineMoEMethod(moe=layer.moe_config) in
+                # vllm/model_executor/layers/quantization/fp8.py. Only omni's own
+                # VllmMxfp8OfflineMoEMethod takes `layer=`.
+                return VllmMxfp8OnlineMoEMethod(moe=layer.moe_config)
             # NPU has no MXFP8 MoE op yet; leave the experts in BF16 rather
             # than failing the whole model load.
             return None
@@ -252,7 +251,7 @@ class _LazyWeightMixin:
                     output_dim=0,
                     weight_loader=patched_weight_loader,
                 )
-                copy_missing_attrs(layer.weight, weight)
+                _copy_missing_attrs(layer.weight, weight)
                 layer.register_parameter("weight", weight)
                 del layer._load_device
 
@@ -510,7 +509,7 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
                 output_dim=0,
                 weight_loader=layer.weight.weight_loader,
             )
-            copy_missing_attrs(layer.weight, weight)
+            _copy_missing_attrs(layer.weight, weight)
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
@@ -620,7 +619,8 @@ class VllmMxfp8OfflineLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Hands the [N, K//32] e8m0 scale to the kernel for its [K//32, N]
-        # relayout, which apply_weights() then recovers with a free .t().
+        # relayout, which apply_weights() then recovers with a free .t(). The
+        # kernel also owns the B-operand layout (VLLM_XPU_FORCE_AB_LAYOUT_WEIGHT).
         self.kernel.process_weights_after_loading(layer)
 
     def apply(

@@ -7,15 +7,17 @@ from unittest.mock import patch
 import pytest
 from torch import nn
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
 from vllm.model_executor.model_loader.utils import configure_quant_config
 
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     WanTransformer3DModel,
 )
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
-from vllm_omni.quantization.inc_config import OmniINCConfig
-from vllm_omni.quantization.mxfp4_config import VllmMxfp4OfflineLinearMethod
+from vllm_omni.quantization.inc_config import (
+    OmniINCConfig,
+    _MXFlattenedLinearMethod,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -83,14 +85,12 @@ def test_wan_autoround_scope_dispatches_only_blocks_to_mxfp4():
     assert layer_config.is_mxfp4
     assert not outside_config.quantized
 
-    fake_method = object()
+    scheme = object()
     with patch(
         "vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_scheme.INCMxfp4Scheme.get_linear_method",
-        return_value=fake_method,
+        return_value=INCLinearMethod(scheme),
     ):
         method = config.get_quant_method(layer, "blocks.0.ffn.net_0.proj")
-    if current_omni_platform.is_xpu():
-        # XPU serves MXFP4 from XPUMxFp4LinearKernel; the INC scheme is not used.
-        assert isinstance(method, VllmMxfp4OfflineLinearMethod)
-    else:
-        assert method is fake_method
+    # vLLM's INC scheme serves the layer; omni only wraps it to flatten 3-D activations.
+    assert isinstance(method, _MXFlattenedLinearMethod)
+    assert method.scheme is scheme

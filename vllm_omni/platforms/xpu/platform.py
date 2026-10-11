@@ -22,6 +22,10 @@ torch.accelerator.get_memory_info = lambda device=None: torch.xpu.mem_get_info(d
 # The XPU sampler kernel is broken for omni on the current vLLM; use the native path.
 os.environ.setdefault("VLLM_XPU_USE_SAMPLER_KERNEL", "0")
 
+# NOTE: the oneDNN "ab" weight layout is NOT enabled here, and nothing in omni
+# enables it -- VLLM_XPU_FORCE_AB_LAYOUT_WEIGHT is vLLM's own knob, defaulting
+# off, and XPUMxFp8LinearKernel is what acts on it.
+
 
 class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     """XPU/Intel GPU implementation of OmniPlatform.
