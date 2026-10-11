@@ -40,6 +40,34 @@
 # dev499+g2c0e2b80e vs dev522+g2ed1db606, triton-xpu 3.7.2 vs triton 3.8.0, and a
 # patched tree vs 6ed0e9d3. Driver and kernel were identical, so those are out.
 #
+# Recorded QUANTIZED cells, 2026-09-28, vllm-omni 0.30.0_rebase (07ba68abe) on
+# 10.239.11.197 cards 0-3. These are a DIFFERENT profile from the table above --
+# they all carry CACHE=1 -- so they are comparable to each other and NOT to the
+# rows above. Reading 212.07 -> 56.39 as an mxfp8 win would be wrong: nearly all
+# of that gap is cache_dit skipping denoise steps. The mxfp8 claim is the 69.97
+# -> 56.39 row pair, which holds CACHE=1 and the ring fixed and varies only the
+# linear method.
+#
+#   cards  linear  kv            cache  warm    timed          peak MB
+#   4      bf16    fp8_sycl_tla  1      92.21   69.97/69.68    90076
+#   4      mxfp8   fp8_sycl_tla  1      41.71   56.39/55.60    53522
+#
+# So at 50 steps mxfp8 is 1.24x faster than bf16 for 41% less peak memory
+# (90076 -> 53522 MB), reps agreeing to 1.4%, both arms emitting MP4s with a
+# video AND an audio stream. Run them as:
+#
+#   CACHE=1 KV_DTYPE=fp8_sycl_tla CARDS=4 bash minimax_h3_va_xpu.sh              # bf16 row
+#   CACHE=1 QUANT=mxfp8 KV_DTYPE=fp8_sycl_tla CARDS=4 bash minimax_h3_va_xpu.sh  # mxfp8 row
+#
+# If the mxfp8 row ever dies with `RuntimeError: scale_q must be finite and
+# positive` (raised natively from sycl_tla_fmha.so), that is NOT a missing-scale
+# bug in vllm-omni: with bf16 q/k/v the wheel is required to receive no scales
+# and derives them itself as amax(|t|).clamp_min(tiny)/448. The clamp makes a
+# zero scale impossible, so it means either a NaN/Inf reached it (blame upstream
+# numerics) or the tensor was all zeros and the scale underflowed (blame weight
+# loading). ring_kernels.py re-raises with per-tensor nan/inf/zero/amax counts to
+# say which of the two it is; quote that line rather than bisecting.
+#
 # Four settings that belong to the container, not to this script, and that were
 # part of every number above -- a run in a container without them is not
 # comparable, so the preflight below warns rather than lets it pass silently:
