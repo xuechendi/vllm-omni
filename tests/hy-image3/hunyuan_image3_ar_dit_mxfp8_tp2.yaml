@@ -1,0 +1,172 @@
+# HunyuanImage-3.0-Instruct-Distil: AR (stage 0) + DiT (stage 1) on FOUR XPU
+# cards, TP=2 each, online MXFP8, with AR->DiT KV reuse over shared memory.
+#
+# The TP=2 sibling of hunyuan_image3_ar_dit_mxfp8_tp1.yaml. That file is the one
+# with the measured numbers and the long rationale for every key; this one is a
+# deliberate *delta* from it and only documents what differs and why. Read it
+# first -- in particular for why both stages carry a full copy of the 80B MoE
+# backbone, why `quantization: mxfp8` has to live on the stage rather than on the
+# command line, and why stage 0 asks for FLASH_ATTN (t2i only; an it2i request
+# through this file is silently wrong, not an error).
+#
+# Card topology, and the only thing this file says about *which* cards: `devices`
+# are logical indices mapped onto physical cards by ZE_AFFINITY_MASK, so with
+# ZE_AFFINITY_MASK=0,1,2,3 stage 0 takes physical 0,1 and stage 1 takes 2,3.
+# The shape matches the committed vllm_omni/deploy/hunyuan_image_3_moe.yaml,
+# which is the reference for this exact 2+2 split.
+#
+# What TP=2 per stage buys, and what it does not: the ~82.5 GiB of MXFP8 weights
+# per stage are sharded, so each card holds ~41 GiB out of 121.6 GiB and the
+# memory pressure that sized the TP=1 file is simply gone. The AR's decode was
+# never memory-bound, though -- it was host-bound on 2,329 op launches per step
+# (see the tp1 file) -- so TP=2 adds an allreduce per layer to a step that was
+# already dominated by launch overhead. Do not assume this is faster than TP=1;
+# it is a scaling datapoint, and the tp1 file's numbers (think_recaption e2e
+# 27.5-29.0s, stage_0 19.6-21.1s, stage_1 7.7s, TPOT ~26.4 ms/token) are the
+# baseline to compare against.
+#
+# KNOWN RISK at stage 0. XPU graph capture is gated by
+# VLLM_XPU_ENABLE_XPU_GRAPH=1, which the driver exports, and
+# vllm/platforms/xpu.py:309 then logs "XPU Graph support is experimental and
+# currently only supports single-GPU execution" -- a warning, not a gate, so
+# capture is still attempted at TP=2 with collectives inside the captured region.
+# The graph is worth ~4x on this model, so it is left enabled here rather than
+# pre-emptively disabled, but the run has to be checked rather than trusted:
+#   - "Capturing CUDA graphs (decode, FULL)" in the log means it took;
+#   - think_recaption end-to-end >~40s means it did not (TPOT falls back to
+#     ~106 ms/token), and the number is an eager-TP=2 number, not a graph one.
+# If capture hangs or dies, rerun with VLLM_XPU_ENABLE_XPU_GRAPH=0 and report
+# that arm instead; do not silently keep a half-captured run.
+#
+# Use with: ZE_AFFINITY_MASK=0,1,2,3 \
+#           DEPLOY=tests/hy-image3/hunyuan_image3_ar_dit_mxfp8_tp2.yaml \
+#           bash hy_image3_ar_dit_mxfp8weight.sh
+pipeline: hunyuan_image_3_moe
+async_chunk: false
+trust_remote_code: true
+
+connectors:
+  # Unchanged from tp1, and unaffected by TP: the connector moves the AR's KV
+  # prefix between two processes on one host, so shared memory stays the right
+  # transport (the committed deploy's Mooncake/RDMA connector is not installed in
+  # this image). What does change is that the handoff is now rank-to-rank across
+  # two TP groups instead of one card to one card.
+  shared_memory_connector:
+    name: SharedMemoryConnector
+
+stages:
+  # ---- stage 0: AR. Prompt -> CoT / recaption + <img_ratio_*> choice. ----
+  - stage_id: 0
+    # Logical 0,1 -> physical cards 0,1 under ZE_AFFINITY_MASK=0,1,2,3.
+    devices: "0,1"
+    # The StageDeployConfig field and the parallel_config entry below must agree;
+    # both are read, by different code paths (stage_init_utils forwards this one
+    # into the engine args, the nested one configures the process group).
+    tensor_parallel_size: 2
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    # See the tp1 file: false here does not mean "compiled", it means graph
+    # capture is allowed while compilation_config pins compile mode to NONE, so
+    # the 80B MoE still runs eager op-by-op and inductor never sees it.
+    enforce_eager: false
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL_DECODE_ONLY
+    # t2i ONLY -- see the header and the tp1 file.
+    attention_backend: FLASH_ATTN
+    enable_prefix_caching: false
+    max_num_batched_tokens: 8192
+    quantization: mxfp8
+    worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker
+    # Not optional: HunyuanImage3 uses mrope and the checkpoint's rope_parameters
+    # do not carry the section layout.
+    hf_overrides:
+      rope_parameters:
+        mrope_section: [0, 32, 32]
+        rope_type: default
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 2
+      # Still false at TP=2, matching the committed 2+2 reference: the 64 experts
+      # are sharded along their intermediate dimension by TP rather than dealt
+      # out to ranks. Expert parallel is the other way to spend these two cards
+      # and would change what the number means, so it is a separate experiment,
+      # not a knob to flip while comparing against tp1.
+      enable_expert_parallel: false
+    omni_kv_config:
+      need_send_cache: true
+    output_connectors:
+      to_stage_1: shared_memory_connector
+    default_sampling_params:
+      # Identical to tp1 on purpose: greedy and seeded, so the CoT is the same
+      # token sequence and any stage-1 difference is attributable to TP alone.
+      temperature: 0.0
+      top_p: 1
+      top_k: -1
+      max_tokens: 8192
+      detokenize: true
+      skip_special_tokens: false
+      include_stop_str_in_output: true
+      seed: 42
+
+  # ---- stage 1: DiT. Recaption + reused KV prefix -> image. ----
+  - stage_id: 1
+    # Logical 2,3 -> physical cards 2,3.
+    devices: "2,3"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    # Genuinely compiled here, unlike stage 0: regional torch.compile over the 32
+    # HunyuanImage3DecoderLayer blocks, paid for by a ~3min first request. The
+    # driver's warm-up request absorbs that.
+    enforce_eager: false
+    # Required at TP>1 and the reason tp1 could leave it out: the in-process
+    # executor only serves a single-card stage. "mp" spawns workers that
+    # re-import __main__, which is why the driver launches the server with
+    # setsid rather than from an interactive shell.
+    distributed_executor_backend: "mp"
+    quantization: mxfp8
+    # 1024x1024 decodes from a 64x64 latent, so neither VAE split is needed, and
+    # at TP=2 the decode is not sharded anyway (vae_patch_parallel_size 1 below).
+    vae_use_slicing: false
+    vae_use_tiling: false
+    cache_backend:
+    cache_config:
+    enable_cache_dit_summary: false
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 2
+      # true, following the committed 2+2 deploy, which is the only validated
+      # reference for this topology. Note this is the opposite of stage 0 above:
+      # there the choice is TP-shard-the-experts to stay comparable with tp1,
+      # here it is what the reference file does. If stage 1 fails at init with an
+      # EP group error, the fallback is false (pure TP) -- say which arm ran.
+      enable_expert_parallel: true
+      # All the sequence/CFG/VAE parallel degrees stay at 1: this run varies
+      # tensor parallelism only, and each of these is a different split of the
+      # same two cards.
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      allgather_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    omni_kv_config:
+      need_recv_cache: true
+      enable_kv_async_prefetch: true
+      kv_prefetch_min_free_mem_ratio: 0.2
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 42
+
+edges:
+  - from: 0
+    to: 1
+    window_size: -1
+    # One request in flight, matching max_num_seqs: 1 on both stages.
+    max_inflight: 1

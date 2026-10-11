@@ -9,6 +9,31 @@
 #   ZE_AFFINITY_MASK=2,3 STEPS=50 bash hy_image3_ar_dit_mxfp8weight.sh
 #   VAE_CHANNELS_LAST=0 bash hy_image3_ar_dit_mxfp8weight.sh   # A/B the NCHW VAE decode
 #
+# Four cards, TP=2 per stage, via the sibling deploy -- DEPLOY is the only thing
+# that changes the topology, and ZE_AFFINITY_MASK must list all four cards
+# because the yaml's `devices` are LOGICAL indices mapped through it (stage 0
+# takes physical 0,1 and stage 1 takes 2,3):
+#
+#   ZE_AFFINITY_MASK=0,1,2,3 DEPLOY=./hunyuan_image3_ar_dit_mxfp8_tp2.yaml \
+#     bash hy_image3_ar_dit_mxfp8weight.sh
+#
+# DEPLOY is handed to --deploy-config verbatim, so it resolves against YOUR cwd,
+# not the script's -- the ./ above assumes you are in this directory, as the
+# examples at the top do. Only the default is absolute (it is derived from $0).
+# Pass a full path when running from anywhere else.
+#
+# Measured that way 2026-09-28, vllm-omni 0.30.0_rebase (07ba68abe) on
+# 10.239.11.197 cards 0-3: both t2i cases produced 1024x1024 PNGs (3,147,861
+# bytes each), model.forward 0.3739 s, final_layer.forward 0.0044 s, vae.decode
+# 0.752-0.757 s, pipeline forward 3.970-3.975 s; recaption 1m33s wall including
+# start-up, think_recaption 16.4 s on the already-warm server.
+#
+# TP=2 is a SCALING DATAPOINT, not a speedup: see the tp2 yaml's header for why
+# (the AR decode is host-bound on op launches, not memory-bound, so sharding adds
+# a per-layer allreduce to a step that was already launch-dominated). What it does
+# buy is headroom -- ~41 GiB per card instead of ~82.5 GiB. Compare against the
+# tp1 numbers below, and state which deploy a number came from.
+#
 # it2i -- image + edit instruction, where the AR *looks at the image* through its
 # SigLIP2 tower before recaptioning -- is the other direction these two stages can
 # serve and it is the reason to run AR+DiT at all (the DiT-only deployment has no
