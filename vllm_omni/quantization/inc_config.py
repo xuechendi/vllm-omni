@@ -7,13 +7,10 @@ from __future__ import annotations
 from os.path import commonprefix
 from typing import TYPE_CHECKING, Any
 
-from vllm.model_executor.layers.linear import LinearBase
+import torch
 from vllm.model_executor.layers.quantization.inc import INCConfig
+from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
 from vllm.model_executor.models.utils import WeightsMapper
-
-from vllm_omni.platforms import current_omni_platform
-from vllm_omni.quantization.mxfp4_config import VllmMxfp4OfflineLinearMethod
-from vllm_omni.quantization.mxfp8_config import VllmMxfp8OfflineLinearMethod
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -52,17 +49,14 @@ def _map_with_stage_prefix(
 class OmniINCConfig(INCConfig):
     """INCConfig extended with multi-stage prefix remapping.
 
-    :class:`INCConfig` is used for AutoRound checkpoint detection and per-layer
-    config resolution only. MX linears are served by omni's own methods on top of
-    the XPU kernels; no INC linear method or scheme is involved.
+    :class:`INCConfig` resolves the checkpoint and selects the scheme. MX linears are
+    vLLM's own INC MX schemes, wrapped only to flatten diffusion's 3-D activations;
+    omni does not reimplement the kernels or the weight handling.
 
     Architecture:
       - AutoRound INT4/INT8 → vLLM INCWna16Scheme
-      - AutoRound MXFP4 (data_type="mx_fp", bits=4), XPU → VllmMxfp4OfflineLinearMethod
-        → XPUMxFp4LinearKernel
-      - AutoRound MXFP8 (data_type="mx_fp", bits=8), XPU → VllmMxfp8OfflineLinearMethod
-        → XPUMxFp8LinearKernel
-      - AutoRound MXFP4 / MXFP8 on other platforms → vLLM INCMxfp4Scheme / INCMxfp8Scheme
+      - AutoRound MXFP4 / MXFP8 linears (data_type="mx_fp") → vLLM INCMxfp4Scheme /
+        INCMxfp8Scheme, wrapped by :class:`_MXFlattenedLinearMethod`
       - AutoRound NVFP4 (data_type="nv_fp") → vLLM CompressedTensorsW4A4Fp4
       - Native MXFP8 (quant_method="mxfp8") → DiffusionMXFP8Config (see mxfp8_config.py)
     """
@@ -75,13 +69,7 @@ class OmniINCConfig(INCConfig):
     # ------------------------------------------------------------------
 
     def get_quant_method(self, layer, prefix: str):
-        """MX linears go straight to the XPU kernels; everything else is vLLM's.
-
-        Resolved from the layer config rather than from vLLM's INC method, so no
-        INC scheme (and no second kernel selection) is built just to be dropped.
-        XPU only: the XPU kernels assert is_supported() in their constructor, so
-        other platforms keep vLLM's INC schemes and their own kernel selection.
-        """
+        """vLLM's method, wrapped for diffusion's 3-D activations on MX linears."""
         if self.data_type == "nv_fp":
             from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -100,14 +88,10 @@ class OmniINCConfig(INCConfig):
                 return CompressedTensorsLinearMethod(self)
             return None
 
-        if self.is_mxfp and current_omni_platform.is_xpu() and isinstance(layer, LinearBase):
-            layer_config = self.config_parser.resolve(layer, prefix)
-            if layer_config.quantized:
-                if layer_config.is_mxfp8:
-                    return VllmMxfp8OfflineLinearMethod()
-                if layer_config.is_mxfp4:
-                    return VllmMxfp4OfflineLinearMethod(group_size=layer_config.group_size)
-        return super().get_quant_method(layer, prefix)
+        method = super().get_quant_method(layer, prefix)
+        if self.is_mxfp and isinstance(method, INCLinearMethod):
+            return _MXFlattenedLinearMethod(method.scheme)
+        return method
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         """Remap HF checkpoint names to vLLM runtime prefixes."""
@@ -196,3 +180,30 @@ class OmniINCConfig(INCConfig):
         if isinstance(quant_config, INCConfig):
             return cls.from_inc_config(quant_config)
         return quant_config
+
+
+# ---------------------------------------------------------------------------
+# AutoRound MXFP8/MXFP4 checkpoints - vLLM's INC MX schemes, 3-D activations
+# ---------------------------------------------------------------------------
+
+
+class _MXFlattenedLinearMethod(INCLinearMethod):
+    """vLLM's INC MX linear method with diffusion activations flattened to 2-D.
+
+    The MX GEMMs behind the INC MXFP4/MXFP8 schemes (``fp4_gemm`` / ``fp8_gemm``
+    on XPU) only accept 2-D activations, while diffusion transformers run
+    (B, S, K) hidden states. Weight creation, layout and the GEMM stay vLLM's;
+    only the reshape is added.
+    """
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.dim() <= 2:
+            return super().apply(layer, x, bias)
+        ori_shape = x.shape
+        output = super().apply(layer, x.reshape(-1, ori_shape[-1]), bias)
+        return output.reshape(*ori_shape[:-1], -1)
