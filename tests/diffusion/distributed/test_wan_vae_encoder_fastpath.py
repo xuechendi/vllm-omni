@@ -107,7 +107,7 @@ def test_encode_frames_assembles_1x1_latents_like_upstream(frames):
     """
     ref, fast = pair()
     assert install_wan_vae_encoder_fastpath(fast).installed
-    seen = {}
+    seen: dict[str, tuple[int, ...]] = {}
     for name, vae in (("expected", ref), ("actual", fast)):
         vae.quant_conv.register_forward_pre_hook(lambda _, args, name=name: seen.__setitem__(name, args[0].stride()))
     x = torch.randn(1, 3, frames, 16, 16)
@@ -398,7 +398,7 @@ def test_encoder_installation_rollback(monkeypatch, failure_stage):
         original_setattr = type(vae.encoder).__setattr__
 
         def fail_binding(module, name, value):
-            original_setattr(module, name, value)
+            original_setattr(module, name, value)  # type: ignore[call-arg]
             if module is vae.encoder and name == fp.CFG_ATTR:
                 raise RuntimeError("injected failure")
 
@@ -470,6 +470,9 @@ def test_encode_frames_declines_compile(monkeypatch):
 def test_omni_encode_dispatch_and_autocast(dtype, monkeypatch):
     from vllm_omni.diffusion.distributed.autoencoders import autoencoder_kl_wan as omni
 
+    # The first encode would bind the compiled VAE norms, which the fast path then (rightly)
+    # refuses to replace; production installs the fast path at load, before any encode.
+    monkeypatch.setenv(omni.COMPILE_ENV, "0")
     torch.manual_seed(4)
     vae = omni.OmniAutoencoderKLWan(**CONFIG).eval().to(dtype)
     pixels = torch.randn(2, 3, 5, 16, 32).to(dtype)
@@ -613,7 +616,7 @@ def test_norm_cache_fusion_falls_back_in_order(monkeypatch, reason):
     elif reason == "dropout_hook":
         dropout.register_forward_hook(lambda *_: events.append("hook"))
     elif reason == "dropout_custom":
-        dropout.forward = lambda x: events.append("custom") or x
+        dropout.forward = lambda x: events.append("custom") or x  # type: ignore[func-returns-value]
     x = torch.randn(1, 8, 1, 3, 5)
     cache = [torch.randn(1, 8, 2, 3, 5)]
     previous = cache[0]

@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
 from contextlib import nullcontext
+from types import MethodType
 from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders import AutoencoderKLWan
-from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+from diffusers.models.autoencoders.autoencoder_kl_wan import (
+    WanDecoder3d,
+    WanEncoder3d,
+    WanResidualBlock,
+    WanRMS_norm,
+    unpatchify,
+)
 from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from vllm.logger import init_logger
@@ -32,7 +40,117 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+# torch.compile the RMS norms of the encoder and decoder, each fused with the SiLU that follows
+# it; on by default, set to 0 for the eager norms. Ring4 720p/61f: encode 3.22 -> 2.58 s, decode
+# 3.01 -> 2.83 s, for ~45 s of one-time compilation on the first request.
+COMPILE_ENV = "VLLM_OMNI_WAN_VAE_COMPILE"
+
+
+def _compile_enabled() -> bool:
+    return os.environ.get(COMPILE_ENV, "1") == "1"
+
+
+def _rms_norm_act(x: torch.Tensor, weight: torch.Tensor, silu: bool) -> torch.Tensor:
+    """``WanRMS_norm`` (channel-first, no bias) optionally followed by SiLU, as one kernel.
+
+    Eager, the norm is five passes over the activation, and the SiLU after
+    it is a sixth; compiled, it is one read and one write. ``weight`` is ``gamma * scale``
+    precomputed in fp32, so the whole chain stays in fp32 registers and rounds to the
+    activation dtype once -- closer to the fp32 reference than either eager path.
+    """
+    x32 = x.float()
+    out = x32 / torch.linalg.vector_norm(x32, dim=1, keepdim=True).clamp_min(1e-12) * weight
+    if silu:
+        out = torch.nn.functional.silu(out)
+    return out.to(x.dtype)
+
+
+_compiled_rms_norm_act = None
+# A 720p decode on a height shard sees dozens of distinct (shape, silu) keys, encode as many again,
+# past dynamo's default of 8 recompiles. The higher limit is applied only around the VAE's own call:
+# raising it globally let the DiT attention (which guards on a call counter) recompile on every
+# step, ring8 diffuse 7.8 -> 35 s.
+_VAE_RECOMPILE_LIMIT = 128
+_LIMIT_NAME = "recompile_limit" if hasattr(torch._dynamo.config, "recompile_limit") else "cache_size_limit"
+
+
+def _get_compiled_rms_norm_act():
+    # One compiled function shared by every norm, compiled static: the dynamic-shape kernel dynamo
+    # switches to after the first shape change measured 1.2-1.6x on the 720p shard shapes, the
+    # per-shape static kernels 2.4-3.1x.
+    global _compiled_rms_norm_act
+    if _compiled_rms_norm_act is None:
+        _compiled_rms_norm_act = torch.compile(_rms_norm_act, dynamic=False)
+    return _compiled_rms_norm_act
+
+
+def _compiled_rms_norm_forward(self: WanRMS_norm, x: torch.Tensor) -> torch.Tensor:
+    fn = _get_compiled_rms_norm_act()
+    with torch._dynamo.config.patch(**{_LIMIT_NAME: _VAE_RECOMPILE_LIMIT}):
+        return fn(x, self._vllm_omni_norm_weight, self._vllm_omni_norm_silu)
+
+
+def _compilable_norm(norm: Any) -> bool:
+    return isinstance(norm, WanRMS_norm) and norm.channel_first and not torch.is_tensor(norm.bias) and not norm.bias
+
+
+def _bind_compiled_norm(norm: WanRMS_norm, *, silu: bool) -> None:
+    norm._vllm_omni_norm_weight = norm.gamma.detach().float() * norm.scale
+    norm._vllm_omni_norm_silu = silu
+    norm._vllm_omni_compiled = True
+    norm.forward = MethodType(_compiled_rms_norm_forward, norm)
+
+
 class OmniAutoencoderKLWan(AutoencoderKLWan):
+    _vae_compile_installed = False
+
+    def _install_vae_compile(self) -> None:
+        """Swap every RMS norm of the encoder and decoder for the compiled ``_rms_norm_act``.
+
+        A norm that a SiLU follows -- both norms of every residual block, and each head's
+        ``norm_out`` -- absorbs it, and the owner's ``nonlinearity`` becomes an identity; that
+        is the only place those modules apply it. The rest (the attention block's norm) are
+        compiled without it. Convolutions stay eager.
+
+        A component that ``wan_vae_fastpath`` is installed on is left alone: its block forwards
+        call the norms through ``_norm_act`` rather than ``norm.forward``, so the SiLU moved into
+        a compiled norm would be dropped. Its own fused norm kernel covers the same ground.
+        """
+        if self._vae_compile_installed:
+            return
+        self._vae_compile_installed = True
+        if not _compile_enabled():
+            return
+
+        fused = plain = 0
+        roots = [
+            m
+            for m, fast_path in (
+                (getattr(self, "encoder", None), is_encoder_installed(self)),
+                (getattr(self, "decoder", None), is_installed(self)),
+            )
+            if m is not None and not fast_path
+        ]
+        for root in roots:
+            for module in root.modules():
+                if isinstance(module, WanResidualBlock):
+                    norms = [module.norm1, module.norm2]
+                elif isinstance(module, (WanEncoder3d, WanDecoder3d)):
+                    norms = [module.norm_out]
+                else:
+                    continue
+                if not isinstance(module.nonlinearity, torch.nn.SiLU) or not all(map(_compilable_norm, norms)):
+                    continue
+                for norm in norms:
+                    _bind_compiled_norm(norm, silu=True)
+                    fused += 1
+                module.nonlinearity = torch.nn.Identity()
+            for module in root.modules():
+                if _compilable_norm(module) and not getattr(module, "_vllm_omni_compiled", False):
+                    _bind_compiled_norm(module, silu=False)
+                    plain += 1
+        logger.info("Compiled Wan VAE RMS norms: %d fused with SiLU, %d plain (encoder + decoder).", fused, plain)
+
     def _execution_context(self):
         try:
             first_param = next(self.parameters())
@@ -50,6 +168,7 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
         )
 
     def encode(self, x: torch.Tensor, return_dict: bool = True):
+        self._install_vae_compile()
         with self._execution_context():
             return super().encode(x, return_dict=return_dict)
 
@@ -71,6 +190,7 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
 
     def decode(self, z: torch.Tensor, return_dict: bool = True):
         """Decode a Wan latent using the Diffusers-compatible full-tensor API."""
+        self._install_vae_compile()
         with self._execution_context():
             return super().decode(z, return_dict=return_dict)
 
