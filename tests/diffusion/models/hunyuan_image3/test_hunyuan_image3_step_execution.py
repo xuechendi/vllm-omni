@@ -43,7 +43,6 @@ def _pipeline():
     pipeline.hf_config = SimpleNamespace(cfg_distilled=False, use_meanflow=False)
     pipeline._pipeline = SimpleNamespace()
     pipeline._denoise_graph_runner = None
-    pipeline._denoise_forward_logged = False
     return pipeline
 
 
@@ -585,11 +584,22 @@ def test_distilled_step_supplies_guidance_and_meanflow_timestep(monkeypatch):
     ],
     ids=["off", "on", "kv-skip-steps", "cache-backend"],
 )
-def test_denoise_graph_runner_is_built_only_when_step_independent(overrides, expect_runner):
+def test_denoise_graph_runner_is_built_only_when_step_independent(monkeypatch, overrides, expect_runner):
+    import vllm_omni.diffusion.distributed.utils as dist_utils
+    import vllm_omni.diffusion.graph as graph_mod
+
+    monkeypatch.setattr(graph_mod, "current_omni_platform", SimpleNamespace(device_type="cpu"))
+    monkeypatch.setattr(dist_utils, "get_local_device", lambda: torch.device("cpu"))
     pipeline = _pipeline()
     pipeline.od_config = SimpleNamespace(**{**vars(pipeline.od_config), **overrides})
+    managers = [SimpleNamespace(keep_prompt_kv_storage=False) for _ in range(2)]
+    pipeline.model = SimpleNamespace(
+        layers=[SimpleNamespace(self_attn=SimpleNamespace(image_attn=mgr)) for mgr in managers]
+    )
 
     assert (pipeline._build_denoise_graph_runner() is not None) == expect_runner
+    # Only a graph needs the prompt KV storage to outlive the request.
+    assert [mgr.keep_prompt_kv_storage for mgr in managers] == [expect_runner] * 2
 
 
 def test_denoise_forward_replays_only_later_gen_image_steps():
@@ -600,15 +610,38 @@ def test_denoise_forward_replays_only_later_gen_image_steps():
         eager_calls.append(kwargs["first_step"]) or {"diffusion_prediction": torch.zeros(1)}
     )
     pipeline._denoise_graph_runner = lambda **kwargs: runner_calls.append(kwargs["mode"]) or torch.ones(1)
-    pipeline._sync_denoise_graphs_with_prompt_kv = lambda: eager_calls.append("sync")
 
     pipeline._denoise_forward({"mode": "gen_image"}, first_step=True)
     pipeline._denoise_forward({"mode": "gen_text"}, first_step=False)
     output = pipeline._denoise_forward({"mode": "gen_image"}, first_step=False)
 
-    assert eager_calls == [True, "sync", False]
+    assert eager_calls == [True, False]
     assert runner_calls == ["gen_image"]
     torch.testing.assert_close(output["diffusion_prediction"], torch.ones(1))
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_prompt_kv_storage_is_kept_only_with_graphs(monkeypatch, keep):
+    invalidations = []
+    monkeypatch.setattr(hy3_transformer_module, "invalidate_denoise_graphs", invalidations.append)
+    mgr = ImageKVCacheManager.__new__(ImageKVCacheManager)
+    mgr.keep_prompt_kv_storage = keep
+    mgr._prompt_kv_storage = None
+    first = (torch.zeros(1, 2, 1, 4), torch.zeros(1, 2, 1, 4), torch.tensor([2]))
+    second = (torch.ones(1, 2, 1, 4), torch.ones(1, 2, 1, 4), torch.tensor([2]))
+    longer = (torch.ones(1, 3, 1, 4), torch.ones(1, 3, 1, 4), torch.tensor([3]))
+
+    mgr.set_prompt_kv_cache(*first)
+    mgr.set_prompt_kv_cache(*second)
+    same_storage = mgr.image_kv_cache_map[0] is first[0]
+    torch.testing.assert_close(mgr.image_kv_cache_map[0], second[0])
+    mgr.set_prompt_kv_cache(*longer)
+
+    assert mgr.image_kv_cache_map[0].shape[1] == 3
+    # With graphs: the second request writes through the first one's storage, a new
+    # length moves it and drops the graphs. Without: plain assignment, as on main.
+    assert same_storage is keep
+    assert len(invalidations) == (2 if keep else 0)
 
 
 @pytest.mark.parametrize(("capturing", "raises"), [(False, True), (True, False)])
@@ -617,7 +650,9 @@ def test_reuse_prompt_kv_debug_check_skipped_during_capture(monkeypatch, capturi
     mgr.image_kv_cache_map = (torch.zeros(1, 2, 1, 4), torch.zeros(1, 2, 1, 4))
     mgr.image_kv_cache_lens = torch.tensor([2])
     monkeypatch.setattr(hy3_transformer_module.logger, "isEnabledFor", lambda level: True)
-    monkeypatch.setattr(hy3_transformer_module, "is_capturing", lambda device: capturing)
+    monkeypatch.setattr(
+        hy3_transformer_module, "current_omni_platform", SimpleNamespace(is_graph_capturing=lambda: capturing)
+    )
     key = value = torch.zeros(1, 3, 1, 4)
     bad_positions = torch.tensor([[7, 8, 9]])  # does not follow the cached prompt length 2
 

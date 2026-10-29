@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -8,13 +9,9 @@ import torch
 
 import vllm_omni.diffusion.graph as graph_mod
 import vllm_omni.diffusion.profiler.diffusion_pipeline_profiler as profiler_mod
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
-from vllm_omni.diffusion.graph import (
-    DenoiseGraphRunner,
-    build_denoise_graph_runner,
-    invalidate_denoise_graphs,
-    write_through,
-)
+from vllm_omni.diffusion.graph import GraphedForward, build_denoise_graph_runner, invalidate_denoise_graphs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -57,16 +54,14 @@ class _FakePlatform:
 
     @staticmethod
     def replay_graph(graph, eager):
-        if graph is None:
-            eager()
-            return
         graph.replay()
 
     def is_graph_capturing(self) -> bool:
         return self.outer_capture or self.capturing is not None
 
-    def synchronize(self) -> None:
-        pass
+    @staticmethod
+    def is_cuda_alike() -> bool:
+        return False
 
     def wrap(self, fn):
         def body(**kwargs):
@@ -84,6 +79,7 @@ class _FakePlatform:
 def fake_graphs(monkeypatch):
     fake = _FakePlatform()
     monkeypatch.setattr(graph_mod, "current_omni_platform", fake)
+    monkeypatch.setattr(graph_mod, "_side_stream", lambda device: nullcontext())
     return fake
 
 
@@ -91,14 +87,19 @@ def _affine(x: torch.Tensor, mode: str = "gen_image") -> torch.Tensor:
     return x * 2 + (1 if mode == "gen_image" else -1)
 
 
-def test_replay_reads_fresh_inputs_and_returns_static_output(fake_graphs):
+def _runner(fake, fn=_affine, **kwargs) -> GraphedForward:
+    kwargs.setdefault("warmup_iters", 1)
+    return GraphedForward(fake.wrap(fn), device=torch.device("cpu"), name="t", **kwargs)
+
+
+def test_replay_reads_fresh_inputs_and_returns_clones(fake_graphs):
     calls = []
 
     def fn(**kwargs):
         calls.append(kwargs)
         return _affine(**kwargs)
 
-    runner = DenoiseGraphRunner(fn=fake_graphs.wrap(fn), name="t")
+    runner = _runner(fake_graphs, fn)
     first = runner(x=torch.tensor([1.0, 2.0]), mode="gen_image")
     torch.testing.assert_close(first, torch.tensor([3.0, 5.0]))
     calls_after_capture = len(calls)
@@ -106,181 +107,95 @@ def test_replay_reads_fresh_inputs_and_returns_static_output(fake_graphs):
     second = runner(x=torch.tensor([10.0, 20.0]), mode="gen_image")
 
     torch.testing.assert_close(second, torch.tensor([21.0, 41.0]))
-    assert second.data_ptr() == first.data_ptr()
-    assert len(calls) == calls_after_capture + 1
-    assert runner.stats_snapshot() == {"calls": 2, "hits": 1, "captures": 1, "eager": 0, "cache_size": 1}
+    # Clones: CFG branches replaying the same graph cannot overwrite each other.
+    torch.testing.assert_close(first, torch.tensor([3.0, 5.0]))
+    assert second.data_ptr() != first.data_ptr()
+    assert len(calls) == calls_after_capture + 1  # the replay, not an eager call
+    assert runner.stats() == {"graphs": 1, "pinned": 0, "captures": 1, "replays": 2, "evictions": 0, "eager_calls": 0}
 
 
-def test_nested_tensor_arguments_are_refreshed(fake_graphs):
-    runner = DenoiseGraphRunner(fn=fake_graphs.wrap(lambda xs: xs[0] + xs[1]), name="t")
+def test_nested_and_list_outputs_are_refreshed(fake_graphs):
+    def fn(xs):
+        return [xs[0] + xs[1], xs[0] - xs[1]]
+
+    def wrapped(**kwargs):
+        outs = fn(**kwargs)
+        graph = fake_graphs.capturing
+        if graph is not None:
+            graph.replay_fn = lambda: [o.copy_(n) for o, n in zip(outs, fn(**kwargs))]
+        return outs
+
+    runner = GraphedForward(wrapped, device=torch.device("cpu"), warmup_iters=0)
     runner(xs=[torch.ones(2), torch.ones(2)])
 
     out = runner(xs=[torch.full((2,), 3.0), torch.full((2,), 4.0)])
 
-    torch.testing.assert_close(out, torch.full((2,), 7.0))
-    assert runner.stats_snapshot()["hits"] == 1
+    torch.testing.assert_close(out[0], torch.full((2,), 7.0))
+    torch.testing.assert_close(out[1], torch.full((2,), -1.0))
+    assert runner.replays == 2 and runner.captures == 1
 
 
-def test_new_shape_or_flag_captures_separately_with_lru_eviction(fake_graphs):
-    runner = DenoiseGraphRunner(fn=fake_graphs.wrap(_affine), name="t", max_graphs=2)
-
-    runner(x=torch.zeros(2), mode="gen_image")
-    runner(x=torch.zeros(3), mode="gen_image")
-    out = runner(x=torch.zeros(3), mode="other")
-
-    torch.testing.assert_close(out, torch.full((3,), -1.0))
-    assert runner.stats_snapshot()["captures"] == 3
-    assert runner.stats_snapshot()["cache_size"] == 2
-
-    runner(x=torch.zeros(2), mode="gen_image")
-    assert runner.stats_snapshot()["captures"] == 4
-
-
-def test_mismatched_constants_for_cached_key_run_eager_and_drop_entry(fake_graphs):
-    runner = DenoiseGraphRunner(fn=fake_graphs.wrap(_affine), name="t")
-    runner(x=torch.zeros(2), mode="gen_image")
-    next(iter(runner._cache.values())).constants["mode"] = "stale"
-
-    out = runner(x=torch.ones(2), mode="gen_image")
-
-    torch.testing.assert_close(out, torch.full((2,), 3.0))
-    assert runner.stats_snapshot()["eager"] == 1
-    assert runner.stats_snapshot()["cache_size"] == 0
-    assert runner.enabled
-
-
-def test_invalidate_drops_graphs_but_keeps_capturing(fake_graphs):
-    runner = DenoiseGraphRunner(fn=fake_graphs.wrap(_affine), name="t")
+def test_new_shape_flag_or_variant_captures_separately_with_lru_eviction(fake_graphs):
+    runner = _runner(fake_graphs, max_entries=2)
     runner(x=torch.zeros(2))
+    runner(x=torch.zeros(2), mode="gen_text")
+    runner(x=torch.zeros(2), variant="lora_on")
+    out = runner(x=torch.ones(3))
 
-    runner.invalidate("buffers moved")
-    out = runner(x=torch.ones(2))
-
-    torch.testing.assert_close(out, torch.full((2,), 3.0))
-    assert runner.enabled
-    assert runner.stats_snapshot()["captures"] == 2
+    torch.testing.assert_close(out, torch.full((3,), 3.0))
+    assert runner.stats()["captures"] == 4 and runner.num_graphs == 2 and runner.stats()["evictions"] == 2
 
 
-def test_capture_failure_disables_runner_and_falls_back_to_eager(fake_graphs, monkeypatch):
+def test_outer_capture_runs_eager(fake_graphs):
+    runner = _runner(fake_graphs)
+    fake_graphs.outer_capture = True
+
+    torch.testing.assert_close(runner(x=torch.ones(2)), torch.full((2,), 3.0))
+    assert runner.enabled and runner.eager_calls == 1 and runner.num_graphs == 0
+
+
+def test_capture_failure_disables_and_releases_earlier_graphs(fake_graphs, monkeypatch):
+    runner = _runner(fake_graphs)
+    runner(x=torch.ones(2))
+    assert runner.num_graphs == 1
+
     def failing_capture(capture, generators=()):
         raise RuntimeError("UR_RESULT_ERROR_UNSUPPORTED_FEATURE")
-
-    monkeypatch.setattr(fake_graphs, "capture_graph", failing_capture)
-    runner = DenoiseGraphRunner(fn=_affine, name="t")
-
-    first = runner(x=torch.ones(2))
-    second = runner(x=torch.zeros(2))
-
-    torch.testing.assert_close(first, torch.full((2,), 3.0))
-    torch.testing.assert_close(second, torch.full((2,), 1.0))
-    assert not runner.enabled
-    assert runner.stats_snapshot()["captures"] == 0
-    assert runner.stats_snapshot()["eager"] == 2
-
-
-def test_capture_failure_releases_graphs_captured_earlier(fake_graphs, monkeypatch):
-    runner = DenoiseGraphRunner(fn=fake_graphs.wrap(_affine), name="t")
-    runner(x=torch.ones(2))
-    assert runner.stats_snapshot()["cache_size"] == 1
-
-    def failing_capture(capture, generators=()):
-        raise RuntimeError("out of memory")
 
     monkeypatch.setattr(fake_graphs, "capture_graph", failing_capture)
     out = runner(x=torch.ones(3))
 
     torch.testing.assert_close(out, torch.full((3,), 3.0))
-    assert not runner.enabled
-    assert runner.stats_snapshot()["cache_size"] == 0
-
-
-def test_invalidate_denoise_graphs_drops_every_runner(fake_graphs):
-    runners = [DenoiseGraphRunner(fn=fake_graphs.wrap(_affine), name=f"t{i}") for i in range(2)]
-    for runner in runners:
-        runner(x=torch.ones(2))
-
-    invalidate_denoise_graphs("adapter changed")
-
-    for runner in runners:
-        assert runner.enabled
-        assert runner.stats_snapshot()["cache_size"] == 0
-        torch.testing.assert_close(runner(x=torch.zeros(2)), torch.full((2,), 1.0))
-        assert runner.stats_snapshot()["captures"] == 2
-
-
-def test_non_tensor_return_disables_runner(fake_graphs):
-    runner = DenoiseGraphRunner(fn=lambda x: {"out": x}, name="t")
-
-    out = runner(x=torch.ones(2))
-
-    assert isinstance(out, dict)
-    assert not runner.enabled
+    assert not runner.enabled and runner.num_graphs == 0
 
 
 def test_platform_without_graphs_disables_runner(fake_graphs, monkeypatch):
     monkeypatch.setattr(fake_graphs, "capture_graph", lambda capture, generators=(): None)
-    runner = DenoiseGraphRunner(fn=_affine, name="t")
-
-    torch.testing.assert_close(runner(x=torch.ones(2)), torch.full((2,), 3.0))
-    torch.testing.assert_close(runner(x=torch.zeros(2)), torch.full((2,), 1.0))
-    assert not runner.enabled
-    assert runner.stats_snapshot()["captures"] == 0
-
-
-def test_arguments_off_the_platform_device_disable_runner(fake_graphs, monkeypatch):
-    monkeypatch.setattr(fake_graphs, "device_type", "xpu")
-    runner = DenoiseGraphRunner(fn=_affine, name="t")
+    runner = _runner(fake_graphs)
 
     torch.testing.assert_close(runner(x=torch.ones(2)), torch.full((2,), 3.0))
     assert not runner.enabled
-    assert not fake_graphs.graphs
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "outer_capture"),
-    [({"x": torch.ones(2)}, True), ({"x": 1.0}, False)],
-    ids=["outer-capture-in-flight", "no-tensor-arguments"],
-)
-def test_runs_eager_without_disabling(fake_graphs, kwargs, outer_capture):
-    fake_graphs.outer_capture = outer_capture
-    runner = DenoiseGraphRunner(fn=_affine, name="t")
-
-    runner(**kwargs)
-
-    assert runner.enabled
-    assert runner.stats_snapshot()["eager"] == 1
-    assert not fake_graphs.graphs
+def test_device_off_the_platform_never_captures(fake_graphs):
+    runner = GraphedForward(_affine, device=torch.device("meta"))
+    assert not runner.enabled
 
 
-def test_write_through_reuses_storage_only_when_layout_matches():
-    dst = torch.zeros(2, 3)
-    same = torch.ones(2, 3)
-    assert write_through(dst, same) is dst
-    torch.testing.assert_close(dst, same)
-
-    other_shape = torch.ones(3, 3)
-    assert write_through(dst, other_shape) is other_shape
-    other_dtype = torch.ones(2, 3, dtype=torch.float16)
-    assert write_through(dst, other_dtype) is other_dtype
-    assert write_through(None, same) is same
-
-
-@pytest.mark.parametrize(("capturing", "expected_syncs"), [(False, 1), (True, 0)])
-def test_profiler_skips_synchronize_during_capture(monkeypatch, capturing, expected_syncs):
-    syncs = []
-    monkeypatch.setattr(
-        profiler_mod,
-        "current_omni_platform",
-        SimpleNamespace(
-            is_available=lambda: True,
-            is_graph_capturing=lambda: capturing,
-            synchronize=lambda: syncs.append(1),
-        ),
-    )
-
-    profiler_mod._sync_if_useful()
-
-    assert len(syncs) == expected_syncs
+def test_profiler_skips_synchronize_during_capture(monkeypatch):
+    for capturing, expected_syncs in ((False, 1), (True, 0)):
+        syncs = []
+        monkeypatch.setattr(
+            profiler_mod,
+            "current_omni_platform",
+            SimpleNamespace(
+                is_available=lambda: True,
+                is_graph_capturing=lambda c=capturing: c,
+                synchronize=lambda: syncs.append(1),
+            ),
+        )
+        profiler_mod._sync_if_useful()
+        assert len(syncs) == expected_syncs
 
 
 def _od_config(**overrides):
@@ -292,15 +207,24 @@ def _od_config(**overrides):
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
 
-def test_build_runner_when_requested_and_safe():
-    runner = build_denoise_graph_runner(_od_config(), lambda x: x, "T")
-    assert isinstance(runner, DenoiseGraphRunner)
-    assert runner.name == "T"
+def _build(fake, od_config, **kwargs):
+    return build_denoise_graph_runner(od_config, fake.wrap(_affine), "T", device=torch.device("cpu"), **kwargs)
+
+
+def test_build_runner_when_requested_and_safe(fake_graphs):
+    runner = _build(fake_graphs, _od_config())
+    assert isinstance(runner, GraphedForward)
+    assert runner.name == "T" and runner.max_entries == 2 and runner.warmup_iters == 1
+
+
+_GATED = AttentionConfig(default=AttentionSpec(backend="TRTLLM_ATTN", skip_softmax={"disabled_until_timestep": 0.5}))
 
 
 @pytest.mark.parametrize(
@@ -316,21 +240,36 @@ def test_build_runner_when_requested_and_safe():
         ({"enable_distributed_layerwise_offload": True}, None),
         ({"diffusion_offload_config": {"mode": "layer", "components": ["dit"]}}, None),
         ({"parallel_config": SimpleNamespace(pipeline_parallel_size=2)}, None),
+        ({"diffusion_kv_cache_skip_step_indices": {0, 3}}, None),
+        ({"diffusion_attention_config": _GATED}, None),
         ({}, "pipeline-specific reason"),
     ],
 )
-def test_build_runner_stays_eager_when_unsafe(overrides, refusal):
-    assert build_denoise_graph_runner(_od_config(**overrides), lambda x: x, "T", refusal=refusal) is None
+def test_build_runner_stays_eager_when_unsafe(fake_graphs, overrides, refusal):
+    assert _build(fake_graphs, _od_config(**overrides), refusal=refusal) is None
 
 
-def test_is_capturing_is_false_for_cpu():
-    assert graph_mod.is_capturing(torch.device("cpu")) is False
+def test_build_runner_defaults_to_the_local_device(fake_graphs, monkeypatch):
+    import vllm_omni.diffusion.distributed.utils as dist_utils
+
+    monkeypatch.setattr(dist_utils, "get_local_device", lambda: torch.device("cpu"))
+    runner = build_denoise_graph_runner(_od_config(), _affine, "T")
+    assert runner is not None and runner.device == torch.device("cpu")
 
 
-def test_is_capturing_follows_the_platform(fake_graphs):
-    fake_graphs.outer_capture = True
-    assert graph_mod.is_capturing(torch.device("cpu")) is True
-    assert graph_mod.is_capturing(torch.device("meta")) is False
+def test_invalidate_denoise_graphs_drops_only_denoise_runners(fake_graphs):
+    runners = [_build(fake_graphs, _od_config()) for _ in range(2)]
+    other = _runner(fake_graphs)  # e.g. a model-owned graph that keys its own LoRA state
+    for runner in (*runners, other):
+        runner(x=torch.ones(2))
+
+    invalidate_denoise_graphs("adapter changed")
+
+    for runner in runners:
+        assert runner.enabled and runner.num_graphs == 0
+        torch.testing.assert_close(runner(x=torch.zeros(2)), torch.full((2,), 1.0))
+        assert runner.captures == 2
+    assert other.num_graphs == 1
 
 
 @pytest.mark.parametrize(

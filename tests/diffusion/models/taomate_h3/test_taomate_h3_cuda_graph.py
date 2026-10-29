@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import weakref
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -267,15 +266,23 @@ def test_copy_into_checks_strides_when_storage_is_shared(monkeypatch) -> None:
 
 
 def test_pinned_entries_survive_real_lru_eviction(monkeypatch) -> None:
-    stream = SimpleNamespace(wait_stream=lambda other: None)
-    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
-    monkeypatch.setattr(torch.cuda, "graph", lambda graph, **kwargs: nullcontext())
-    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: SimpleNamespace(pool=lambda: None, replay=lambda: None))
+    import vllm_omni.diffusion.graph as graph_mod
+
+    def capture_graph(capture, generators=()):
+        capture()
+        return SimpleNamespace(replay=lambda: None)
+
+    platform = SimpleNamespace(
+        device_type="cpu",
+        capture_graph=capture_graph,
+        replay_graph=lambda graph, eager: graph.replay(),
+        is_graph_capturing=lambda: False,
+        is_cuda_alike=lambda: False,
+    )
+    monkeypatch.setattr(graph_mod, "current_omni_platform", platform)
     graph = GraphedForward(_Doubler(), device=torch.device("cpu"), max_entries=3, warmup_iters=0)
-    graph.enabled = True
-    graph._probe_pending = False  # Only CUDA primitives are stubbed; capture and eviction run unchanged.
+    assert graph.enabled
+    graph._probe_pending = False  # Only the platform graph hooks are stubbed; capture and eviction run unchanged.
 
     def forward(variant, *, pin=False, keep_alive=()):
         graph(variant=variant, pin=pin, keep_alive=keep_alive, x=torch.ones(2), scale=2.0)

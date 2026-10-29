@@ -1,41 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Device graph capture and replay for diffusion denoise steps.
+"""Device-graph replay of fixed-shape diffusion forwards (CUDA graphs, XPU graphs).
 
-A denoise loop calls the transformer once per step with *identical* tensor
-shapes; only tensor contents change. After the first step the call is therefore
-a fixed sequence of kernels over fixed buffers, which is exactly what a device
-graph records: capture once, then replay and pay no per-kernel launch cost.
-
-How much that is worth depends on how launch-bound the step already is. For a
-HunyuanImage3 1024x1024 denoise (regional torch.compile + FLASH_ATTN, one XPU
-card) the device is busy 82.6% of the denoise span, with 13.5% of the span lost
-to 13.9k sub-millisecond gaps between kernels. So a graph is worth roughly 10%
-here -- not the 3.8x that the launch-bound AR decode loop gets from the same
-mechanism. Expect single digits to low teens.
+``GraphedForward`` wraps a keyword-only forward. Calls are keyed by the
+*structure* of their kwargs (tensor shapes/dtypes and every non-tensor value);
+the first call of a key captures a graph on static copies of the tensors and
+later calls copy the live tensors into those buffers and replay. Values that
+only change per call are therefore ordinary inputs and never force a
+re-capture; only a new *shape* does.
 
 Capture and replay go through ``current_omni_platform.capture_graph`` /
-``replay_graph``, so the device specifics live in one place per platform: CUDA
-captures into vLLM's global graph pool, while XPU gives every graph a private
-pool, because on torch 2.14+xpu capturing into a shared pool after another graph
-in it was freed hits an XPUCachingAllocator assert. Platforms without graph
-support return ``None`` from ``capture_graph`` and the runner stays eager.
+``replay_graph``, so the device specifics live in one place per platform (CUDA
+shares vLLM's graph pool; XPU gives every graph a private pool). Graph capture
+forbids host synchronization inside the captured region. On CUDA the very first
+capture is validated with ``torch.cuda.set_sync_debug_mode("error")``, so a
+synchronizing operator fails loudly on every rank at the same program point
+instead of leaving peers waiting in a collective. Any failure disables the
+wrapper for the rest of the process (agreed across ``group`` when one is given)
+and the caller falls back to eager execution.
 
-Safety model: every tensor argument is copied into a capture-owned static
-buffer before each replay, so the runner never depends on the caller handing
-back the same tensor objects. Non-tensor arguments must compare equal to their
-capture-time values; if any of them differs the call falls back to eager,
-because the graph froze whatever branch they selected. Anything the callee
-reads from outside its arguments (module attributes, forward context) is the
-caller's responsibility -- see :meth:`DenoiseGraphRunner.__call__`.
+``build_denoise_graph_runner`` is the opt-in for diffusion denoise steps
+(``diffusion_use_graph``): it refuses configurations in which a step reads
+state the graph cannot see, so a replay could silently diverge from eager.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import traceback
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -46,253 +43,375 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
-# Every live runner in this process, so state owned outside the pipeline (LoRA
-# adapters) can drop the graphs that froze it. Keyed by id(): runners are
-# dataclasses and therefore unhashable.
-_RUNNERS: weakref.WeakValueDictionary[int, DenoiseGraphRunner] = weakref.WeakValueDictionary()
+_PRIMITIVES = (int, float, bool, str, bytes, type(None))
 
 
-def write_through(dst: torch.Tensor | None, src: torch.Tensor) -> torch.Tensor:
-    """Write ``src`` into ``dst``'s storage when they match, otherwise return ``src``.
-
-    For state that a graph body reads off a module rather than off its arguments:
-    rebinding such a tensor would leave the replay pointing at a freed
-    allocation, so the buffer has to keep the same storage once its shape has
-    settled. The caller must invalidate its graphs whenever this returns ``src``,
-    because that is the case where the storage did move.
-    """
-    if dst is not None and dst.shape == src.shape and dst.dtype == src.dtype and dst.device == src.device:
-        dst.copy_(src)
-        return dst
-    return src
-
-
-def is_capturing(device: torch.device) -> bool:
-    """Whether a device graph is recording on ``device``'s current stream.
-
-    For host-side checks that read a device tensor (``.item()``, ``bool()``):
-    such a read synchronizes, which a capture rejects.
-    """
-    return device.type == current_omni_platform.device_type and current_omni_platform.is_graph_capturing()
-
-
-def _structural_key(value: Any) -> Any:
-    """A hashable summary of one argument: shape/dtype for tensors, value else.
-
-    Two calls with the same key are replay-compatible *provided* the non-tensor
-    parts also compare equal, which :meth:`DenoiseGraphRunner._constants_match`
-    checks separately -- the key only has to be cheap and hashable.
-    """
+def kwargs_signature(value: Any) -> Any:
+    """A hashable description of ``value`` in which tensors count by shape and dtype only."""
     if isinstance(value, torch.Tensor):
-        return ("t", tuple(value.shape), value.dtype, value.device.type, value.device.index)
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
-        return ("v", value)
-    if isinstance(value, Mapping):
-        return ("m", tuple((k, _structural_key(v)) for k, v in sorted(value.items())))
-    if isinstance(value, Sequence):
-        return ("s", type(value).__name__, tuple(_structural_key(v) for v in value))
-    # Opaque objects (caches, generators, modules). Keyed by identity, so a new
-    # object is a cache miss rather than a silently wrong replay.
-    return ("o", type(value).__name__, id(value))
-
-
-def _clone_static(value: Any) -> Any:
-    """Capture-owned copy of an argument, preserving container structure."""
-    if isinstance(value, torch.Tensor):
-        return value.detach().clone().contiguous()
-    if isinstance(value, Mapping):
-        return {k: _clone_static(v) for k, v in value.items()}
+        return ("tensor", tuple(value.shape), str(value.dtype), value.device.type)
+    if isinstance(value, dict):
+        return ("dict", tuple((str(key), kwargs_signature(value[key])) for key in sorted(value, key=str)))
     if isinstance(value, (list, tuple)):
-        cloned = [_clone_static(v) for v in value]
-        return type(value)(cloned) if isinstance(value, list) else tuple(cloned)
-    return value
+        return (type(value).__name__, tuple(kwargs_signature(item) for item in value))
+    if isinstance(value, _PRIMITIVES):
+        return ("value", type(value).__name__, value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return (
+            type(value).__qualname__,
+            tuple((field.name, kwargs_signature(getattr(value, field.name))) for field in dataclasses.fields(value)),
+        )
+    return ("repr", type(value).__qualname__, repr(value))
 
 
-def _copy_into_static(static: Any, fresh: Any) -> None:
-    """Refresh the capture-owned buffers in place from this call's arguments."""
+def _holds_tensor(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, dict):
+        return any(_holds_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_holds_tensor(item) for item in value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(_holds_tensor(getattr(value, field.name)) for field in dataclasses.fields(value))
+    return False
+
+
+def clone_static(value: Any) -> Any:
+    """Deep-copy the tensors of a kwargs tree into fresh contiguous buffers.
+
+    Tensors are reached through dicts, lists and tuples only. Any other object
+    (a layout dataclass, a device, a dtype) is passed through unchanged and
+    must not hold a tensor: it would keep its capture-time address without
+    being refreshed on replay, so such objects are rejected.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone(memory_format=torch.contiguous_format)
+    if isinstance(value, dict):
+        return {key: clone_static(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(clone_static(item) for item in value)
+    if isinstance(value, list):
+        return [clone_static(item) for item in value]
+    if isinstance(value, (*_PRIMITIVES, torch.device, torch.dtype, torch.Size)):
+        return value
+    if dataclasses.is_dataclass(value) and not isinstance(value, type) and not _holds_tensor(value):
+        return value
+    raise TypeError(
+        "graph kwargs may hold tensors inside dicts, lists and tuples, primitives, torch.device/dtype/Size and "
+        f"tensor-free dataclasses only, got {type(value)!r}"
+    )
+
+
+def copy_into(static: Any, current: Any) -> int:
+    """Copy the tensors of ``current`` into the matching buffers of ``static``.
+
+    Returns the number of tensors copied. The trees must share one signature.
+    """
     if isinstance(static, torch.Tensor):
-        static.copy_(fresh, non_blocking=True)
-        return
-    if isinstance(static, Mapping):
-        for k, v in static.items():
-            _copy_into_static(v, fresh[k])
-        return
+        if not isinstance(current, torch.Tensor) or static.shape != current.shape or static.dtype != current.dtype:
+            raise ValueError("graph input differs in shape or dtype from the captured buffer")
+        if static.data_ptr() != current.data_ptr() or static.stride() != current.stride():
+            static.copy_(current)
+        return 1
+    if isinstance(static, dict):
+        if not isinstance(current, dict) or static.keys() != current.keys():
+            raise ValueError("graph input keys differ from the captured kwargs")
+        return sum(copy_into(static[key], current[key]) for key in static)
     if isinstance(static, (list, tuple)):
-        for v, f in zip(static, fresh):
-            _copy_into_static(v, f)
-
-
-def _non_tensor_parts(value: Any) -> Any:
-    """Strip tensors out, leaving the parts that must compare equal."""
-    if isinstance(value, torch.Tensor):
-        return None
-    if isinstance(value, Mapping):
-        return {k: _non_tensor_parts(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_non_tensor_parts(v) for v in value]
-    return value
+        if not isinstance(current, (list, tuple)) or len(static) != len(current):
+            raise ValueError("graph input sequence differs from the captured kwargs")
+        return sum(copy_into(s, c) for s, c in zip(static, current, strict=True))
+    return 0
 
 
 @dataclass
-class _GraphEntry:
+class _Entry:
     graph: Any
-    static_in: dict[str, Any]
-    static_out: torch.Tensor
-    constants: dict[str, Any]
+    static_kwargs: dict[str, Any]
+    outputs: Any
+    # Objects whose tensors the captured kernels read by address although
+    # they are not among the kwargs (for example an embedding plan installed
+    # through a context variable). The entry owns a reference so the memory
+    # cannot be freed and reused while the graph is resident.
+    keep_alive: tuple[Any, ...] = ()
+    # Pinned entries (captured up front for a configured shape range) are
+    # never evicted by later, unpinned shapes.
+    pinned: bool = False
 
 
-@dataclass
-class DenoiseGraphRunner:
-    """Replay ``fn(**kwargs) -> Tensor`` from a per-shape device graph.
+@contextmanager
+def _sync_debug_mode(mode: str) -> Iterator[None]:
+    """Make host synchronization raise. CUDA only; other platforms run the probe as-is."""
+    if not current_omni_platform.is_cuda_alike():
+        yield
+        return
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode(mode)
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
 
-    ``fn`` must be a pure function of its tensor arguments: same shapes in, same
-    kernels out, no host synchronisation (no ``.item()``, ``.cpu()``, data
-    dependent control flow) and no reliance on state that changes between steps.
-    A denoise step satisfies this once the first step is past, provided the
-    caller keeps everything the callee reads off its arguments pinned to the
-    same buffers for the life of the graph.
 
-    Graphs are cached per structural key with a small LRU, so a new image size
-    costs one extra eager step rather than a wrong result. Any capture failure
-    disables the runner for the rest of the process and falls back to eager.
-    """
+@contextmanager
+def _side_stream(device: torch.device) -> Iterator[None]:
+    """Run the warm-up forwards on a side stream, ordered after the current work."""
+    current = torch.accelerator.current_stream(device)
+    side = torch.Stream(device=device)
+    side.wait_stream(current)
+    with side:
+        yield
+    current.wait_stream(side)
 
-    fn: Callable[..., torch.Tensor]
-    name: str
-    max_graphs: int = 2
-    enabled: bool = True
-    _cache: OrderedDict[Any, _GraphEntry] = field(default_factory=OrderedDict, repr=False)
-    _stats: dict[str, int] = field(default_factory=lambda: dict.fromkeys(("calls", "hits", "captures", "eager"), 0))
 
-    def __post_init__(self) -> None:
-        _RUNNERS[id(self)] = self
+class GraphedForward:
+    """Capture-and-replay wrapper around a keyword-only forward."""
 
-    def stats_snapshot(self) -> dict[str, int]:
-        return {**self._stats, "cache_size": len(self._cache)}
+    def __init__(
+        self,
+        module: Callable[..., Any],
+        *,
+        device: torch.device,
+        max_entries: int = 16,
+        warmup_iters: int = 2,
+        group: torch.distributed.ProcessGroup | None = None,
+        name: str = "graph",
+        enabled: bool = True,
+        capture_context: Callable[[], AbstractContextManager] | None = None,
+    ) -> None:
+        if max_entries < 1:
+            raise ValueError("max_entries must be at least 1")
+        self.module = module
+        self.device = torch.device(device)
+        self.max_entries = int(max_entries)
+        self.warmup_iters = int(warmup_iters)
+        self.group = group
+        self.name = name
+        self.enabled = bool(enabled) and self.device.type == current_omni_platform.device_type
+        # Entered around the probe, warm-up and capture forwards, e.g. to bypass a
+        # host-keyed cache that would otherwise synchronize under capture.
+        self.capture_context = capture_context or nullcontext
+        self._entries: OrderedDict[Any, _Entry] = OrderedDict()
+        self._probe_pending = True
+        self._pinned_overflow_warned = False
+        self.captures = 0
+        self.replays = 0
+        self.evictions = 0
+        self.eager_calls = 0
 
-    def invalidate(self, reason: str) -> None:
-        """Drop the captured graphs, but keep capturing new ones.
+    # -- public --------------------------------------------------------------
 
-        For when a buffer the callee reads off its arguments got reallocated: the
-        recorded kernels still point at the old addresses, so those graphs are
-        dead, but a fresh capture against the new buffers is fine.
+    def __call__(
+        self, *, variant: Any = None, keep_alive: tuple[Any, ...] = (), pin: bool = False, **kwargs: Any
+    ) -> Any:
+        """Run ``module(**kwargs)``, by replay when a graph of this shape exists.
+
+        ``variant`` distinguishes module states the kwargs do not show (for
+        example whether the LoRA hooks are enabled, or which embedding plan is
+        installed); ``keep_alive`` holds every object outside ``kwargs`` whose
+        tensors the forward reads, so a resident graph keeps them allocated;
+        ``pin`` exempts a newly captured graph from LRU eviction. Returned
+        tensors are clones, so the caller may hold them across the next call.
         """
-        if self._cache:
-            logger.debug("%s: dropping %d captured denoise graph(s) (%s)", self.name, len(self._cache), reason)
-            self._cache.clear()
+        if not self.enabled or current_omni_platform.is_graph_capturing():
+            # Inside someone else's capture the outer graph records these kernels anyway.
+            self.eager_calls += 1
+            return self.module(**kwargs)
+        key = (kwargs_signature(variant), kwargs_signature(kwargs))
+        entry = self._entries.get(key)
+        if entry is None:
+            entry = self._capture(key, kwargs, keep_alive, variant, pin=pin)
+            if entry is None:
+                self.eager_calls += 1
+                return self.module(**kwargs)
+        else:
+            entry.pinned = entry.pinned or pin
+            copy_into(entry.static_kwargs, kwargs)
+            self._entries.move_to_end(key)
+        current_omni_platform.replay_graph(entry.graph, lambda: None)
+        self.replays += 1
+        return _clone_outputs(entry.outputs)
+
+    @property
+    def num_graphs(self) -> int:
+        return len(self._entries)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "graphs": len(self._entries),
+            "pinned": sum(1 for entry in self._entries.values() if entry.pinned),
+            "captures": self.captures,
+            "replays": self.replays,
+            "evictions": self.evictions,
+            "eager_calls": self.eager_calls,
+        }
+
+    def clear(self) -> None:
+        """Release captured graphs before the buffers they read off-argument are freed."""
+        self._entries.clear()
 
     def disable(self, reason: str) -> None:
         if self.enabled:
-            logger.warning("%s: disabling denoise graphs (%s)", self.name, reason)
+            logger.warning("%s device graphs disabled: %s", self.name, reason)
         self.enabled = False
-        self._cache.clear()
+        self.clear()
 
-    def __call__(self, **kwargs: Any) -> torch.Tensor:
-        self._stats["calls"] += 1
-        device = _first_tensor_device(kwargs)
-        if not self.enabled or device is None:
-            if device is None:
-                # Silent here would be indistinguishable from never being called.
-                logger.warning_once("%s: no device tensor among the arguments; running eager", self.name)
-            self._stats["eager"] += 1
-            return self.fn(**kwargs)
-        if device.type != current_omni_platform.device_type:
-            self.disable(f"arguments are on {device.type!r}, not on the {current_omni_platform.device_type!r} platform")
-            self._stats["eager"] += 1
-            return self.fn(**kwargs)
-        if current_omni_platform.is_graph_capturing():
-            # Already inside someone else's capture; recording a nested graph is
-            # not allowed, and the outer capture covers these kernels anyway.
-            logger.warning_once("%s: an outer capture is in flight; running eager", self.name)
-            self._stats["eager"] += 1
-            return self.fn(**kwargs)
+    # -- capture -------------------------------------------------------------
 
-        key = tuple(sorted((k, _structural_key(v)) for k, v in kwargs.items()))
-        entry = self._cache.get(key)
-        if entry is not None and not self._constants_match(entry, kwargs):
-            # Same shapes, different flags: the graph froze the other branch.
-            logger.warning_once("%s: non-tensor arguments changed for a cached shape; running eager", self.name)
-            del self._cache[key]
-            entry = None
-            self._stats["eager"] += 1
-            return self.fn(**kwargs)
-
-        if entry is None:
-            entry = self._capture(kwargs)
-            if entry is None:
-                self._stats["eager"] += 1
-                return self.fn(**kwargs)
-            self._cache[key] = entry
-            while len(self._cache) > self.max_graphs:
-                self._cache.popitem(last=False)
-            self._stats["captures"] += 1
-            # Capture records kernels without running them, so the static output
-            # holds nothing until the first replay.
-            self._replay(entry)
-            return entry.static_out
-
-        self._cache.move_to_end(key)
-        self._stats["hits"] += 1
-        for name, static in entry.static_in.items():
-            _copy_into_static(static, kwargs[name])
-        self._replay(entry)
-        # The caller gets the graph's own output buffer. It stays valid until the
-        # next replay, and every consumer is enqueued on this stream before then.
-        return entry.static_out
-
-    def _constants_match(self, entry: _GraphEntry, kwargs: dict[str, Any]) -> bool:
-        """Backstop for the structural key, which normally separates these already.
-
-        The key carries plain values verbatim, so a changed flag is usually just a
-        miss. What it cannot catch is an opaque argument keyed by ``id()`` that a
-        freed-and-reallocated object now collides with; comparing by ``==`` does.
-        """
-        if set(kwargs) != set(entry.constants):
-            return False
-        return all(_non_tensor_parts(v) == entry.constants[k] for k, v in kwargs.items())
-
-    def _replay(self, entry: _GraphEntry) -> None:
-        current_omni_platform.replay_graph(entry.graph, lambda: entry.static_out.copy_(self.fn(**entry.static_in)))
-
-    def _capture(self, kwargs: dict[str, Any]) -> _GraphEntry | None:
-        static_in = {k: _clone_static(v) for k, v in kwargs.items()}
-        captured: list[torch.Tensor] = []
-
-        def body() -> None:
-            captured.append(self.fn(**static_in))
-
+    def _capture(
+        self,
+        key: Any,
+        kwargs: dict[str, Any],
+        keep_alive: tuple[Any, ...] = (),
+        variant: Any = None,
+        *,
+        pin: bool = False,
+    ) -> _Entry | None:
+        failure: str | None = None
+        static: dict[str, Any] = {}
+        graph: Any = None
+        captured: list[Any] = []
         try:
-            # Warm run outside capture: kernel autotuning, lazy module init and
-            # any torch.compile guard/codegen must not happen under capture.
-            with torch.no_grad():
-                warm = self.fn(**static_in)
-            if not isinstance(warm, torch.Tensor):
-                self.disable(f"callee returned {type(warm).__name__}, expected a Tensor")
-                return None
-            current_omni_platform.synchronize()
-            with torch.no_grad():
-                graph = current_omni_platform.capture_graph(body)
-        except Exception:
-            logger.warning(
-                "%s: graph capture failed, continuing eager for the rest of the process",
-                self.name,
-                exc_info=True,
-            )
-            # disable() also frees the graphs captured so far: none can replay again.
-            self.disable("graph capture failed")
+            static = clone_static(kwargs)
+            with self.capture_context():
+                if self._probe_pending:
+                    # A synchronizing operator raises here on every rank at
+                    # the same point, before any capture starts.
+                    with _sync_debug_mode("error"):
+                        self.module(**static)
+                    self._probe_pending = False
+                # The first capture warms lazy kernel/library state for the
+                # whole process; later shapes need a single warm forward.
+                warmups = self.warmup_iters if self.captures == 0 else min(self.warmup_iters, 1)
+                if warmups:
+                    with _side_stream(self.device):
+                        for _ in range(warmups):
+                            self.module(**static)
+                graph = current_omni_platform.capture_graph(lambda: captured.append(self.module(**static)))
+            if graph is None:
+                failure = f"{type(current_omni_platform).__name__} cannot capture device graphs"
+        except Exception as exc:  # noqa: BLE001 - any capture failure means eager from now on
+            failure = f"{type(exc).__name__}: {exc}"
+            logger.warning("%s device graph capture failed:\n%s", self.name, traceback.format_exc())
+        ok = self._agree(failure is None)
+        if not ok:
+            del graph, captured, static
+            self.disable(failure or "a peer rank failed to capture")
             return None
-        if graph is None:
-            self.disable(f"{type(current_omni_platform).__name__} cannot capture device graphs")
-            return None
-        static_out = captured[0]
-        shapes = {k: tuple(v.shape) for k, v in kwargs.items() if isinstance(v, torch.Tensor)}
-        logger.info("%s: captured denoise graph, input shapes %s", self.name, shapes)
-        return _GraphEntry(
-            graph=graph,
-            static_in=static_in,
-            static_out=static_out,
-            constants={k: _non_tensor_parts(v) for k, v in kwargs.items()},
-        )
+        if len(self._entries) >= self.max_entries:
+            victim = next((k for k, e in self._entries.items() if not e.pinned), None)
+            if victim is None:
+                if not self._pinned_overflow_warned:
+                    self._pinned_overflow_warned = True
+                    logger.warning(
+                        "%s: all %d resident device graphs are pinned; growing past max_entries",
+                        self.name,
+                        len(self._entries),
+                    )
+            else:
+                del self._entries[victim]
+                self.evictions += 1
+        entry = _Entry(graph=graph, static_kwargs=static, outputs=captured[0], keep_alive=tuple(keep_alive), pinned=pin)
+        self._entries[key] = entry
+        self.captures += 1
+        logger.info("%s device graph captured for %s (%d resident)", self.name, variant, len(self._entries))
+        return entry
+
+    def _agree(self, ok: bool) -> bool:
+        group = self.group
+        if group is None or torch.distributed.get_world_size(group) <= 1:
+            return ok
+        flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=self.device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=group)
+        return bool(int(flag.item()))
+
+
+def _clone_outputs(outputs: Any) -> Any:
+    if isinstance(outputs, torch.Tensor):
+        return outputs.clone()
+    if isinstance(outputs, tuple):
+        return tuple(_clone_outputs(item) for item in outputs)
+    if isinstance(outputs, list):
+        return [_clone_outputs(item) for item in outputs]
+    if isinstance(outputs, dict):
+        return {key: _clone_outputs(item) for key, item in outputs.items()}
+    return outputs
+
+
+# -- denoise steps -------------------------------------------------------------
+
+# Runners built for denoise steps, so state owned outside the pipeline (the active
+# LoRA adapter) can drop the graphs that froze it.
+_DENOISE_RUNNERS: weakref.WeakSet[GraphedForward] = weakref.WeakSet()
+
+
+def denoise_graph_refusal(od_config: Any) -> str | None:
+    """Why a captured denoise step could diverge from eager under ``od_config``, or None.
+
+    A replay re-runs the kernels the capture step chose. Anything a step reads
+    outside its arguments -- the forward context's step index or timestep, a
+    per-request KV layout, weights moved by hooks -- is frozen at capture time.
+    """
+    # Lazy: the offloader package imports diffusion.data, which imports the LoRA
+    # manager, which imports this module.
+    from vllm_omni.diffusion.offloader.config import offload_enabled
+
+    kv_mode = DiffusionKVCacheMode(getattr(od_config, "diffusion_kv_mode", None) or DiffusionKVCacheMode.DENSE_LEGACY)
+    cache_backend = getattr(od_config, "cache_backend", None) or "none"
+    parallel_config = getattr(od_config, "parallel_config", None)
+    attention_config = getattr(od_config, "diffusion_attention_config", None)
+    attention_specs = [getattr(attention_config, "default", None), *getattr(attention_config, "per_role", {}).values()]
+    if getattr(od_config, "enforce_eager", False):
+        return "enforce_eager=True"
+    if kv_mode is not DiffusionKVCacheMode.DENSE_LEGACY:
+        return f"diffusion_kv_mode={kv_mode.value!r} reads per-request paged KV state outside the step arguments"
+    if cache_backend != "none":
+        return f"cache_backend={cache_backend!r} decides per step whether the transformer runs at all"
+    if offload_enabled(od_config):
+        return "CPU offload moves the weights that a captured graph reads"
+    if getattr(parallel_config, "pipeline_parallel_size", 1) > 1:
+        return "pipeline parallelism hands intermediate tensors between stages"
+    if getattr(od_config, "diffusion_kv_cache_skip_step_indices", None):
+        return "diffusion_kv_cache_skip_steps picks the attention KV dtype from the step index"
+    if any(getattr(getattr(spec, "skip_softmax", None), "disabled_until_timestep", 0) for spec in attention_specs):
+        return "skip-softmax disabled_until_timestep picks dense or sparse attention from the timestep"
+    return None
+
+
+def build_denoise_graph_runner(
+    od_config: Any,
+    module: Callable[..., Any],
+    name: str,
+    *,
+    device: torch.device | None = None,
+    refusal: str | None = None,
+    max_entries: int = 2,
+) -> GraphedForward | None:
+    """Return a denoise-step runner if ``od_config`` opts in and nothing makes a step unsafe to replay.
+
+    ``refusal`` lets the pipeline add its own reason to stay eager. ``device``
+    defaults to this rank's accelerator (pipelines build runners before their
+    weights are on it).
+    """
+    requested = bool(getattr(od_config, "diffusion_use_graph", False))
+    # Stated either way: a silent None is indistinguishable from "engaged and did not pay".
+    logger.info("%s: diffusion_use_graph=%s", name, requested)
+    if not requested:
+        return None
+    refusal = refusal or denoise_graph_refusal(od_config)
+    if refusal is not None:
+        logger.warning("%s: diffusion_use_graph ignored because %s", name, refusal)
+        return None
+    if device is None:
+        from vllm_omni.diffusion.distributed.utils import get_local_device
+
+        device = get_local_device()
+    runner = GraphedForward(module, device=device, max_entries=max_entries, warmup_iters=1, name=name)
+    if not runner.enabled:
+        logger.warning("%s: diffusion_use_graph ignored because %s has no device graphs", name, device)
+        return None
+    _DENOISE_RUNNERS.add(runner)
+    return runner
 
 
 def invalidate_denoise_graphs(reason: str) -> None:
@@ -302,63 +421,10 @@ def invalidate_denoise_graphs(reason: str) -> None:
     the pipeline, such as which LoRA adapter is active: its Python branches ran
     once at capture time, so a replay keeps the capture-time adapter.
     """
-    for runner in list(_RUNNERS.values()):
-        runner.invalidate(reason)
-
-
-def _first_tensor_device(kwargs: Mapping[str, Any]) -> torch.device | None:
-    for value in kwargs.values():
-        if isinstance(value, torch.Tensor):
-            return value.device
-        if isinstance(value, (list, tuple)):
-            for inner in value:
-                if isinstance(inner, torch.Tensor):
-                    return inner.device
-    return None
-
-
-def build_denoise_graph_runner(
-    od_config: Any,
-    fn: Callable[..., torch.Tensor],
-    name: str,
-    *,
-    refusal: str | None = None,
-) -> DenoiseGraphRunner | None:
-    """Return a runner if ``od_config`` opts in and nothing makes a step unsafe to replay.
-
-    ``refusal`` lets the pipeline add its own reason to stay eager.
-    """
-    # Lazy: the offloader package imports diffusion.data, which imports the LoRA
-    # manager, which imports this module.
-    from vllm_omni.diffusion.offloader.config import offload_enabled
-
-    requested = bool(getattr(od_config, "diffusion_use_graph", False))
-    # Stated either way: a silent None is indistinguishable from "engaged and did not pay".
-    logger.info("%s: diffusion_use_graph=%s", name, requested)
-    if not requested:
-        return None
-    cache_backend = getattr(od_config, "cache_backend", None) or "none"
-    parallel_config = getattr(od_config, "parallel_config", None)
-    kv_mode = DiffusionKVCacheMode(getattr(od_config, "diffusion_kv_mode", None) or DiffusionKVCacheMode.DENSE_LEGACY)
-    if refusal is None and getattr(od_config, "enforce_eager", False):
-        refusal = "enforce_eager=True"
-    if refusal is None and kv_mode is not DiffusionKVCacheMode.DENSE_LEGACY:
-        # The attention layers take the paged KV adapter (block tables, slot
-        # mapping) from the forward context, not from the step's arguments, so
-        # a replay would keep reading the capture-time request's KV layout.
-        refusal = f"diffusion_kv_mode={kv_mode.value!r} reads per-request paged KV state outside the step arguments"
-    if refusal is None and cache_backend != "none":
-        refusal = f"cache_backend={cache_backend!r} decides per step whether the transformer runs at all"
-    if refusal is None and offload_enabled(od_config):
-        # Every strategy (model-level, layerwise, distributed layerwise) and the
-        # diffusion_offload_config API: hooks move or all-gather the weights.
-        refusal = "CPU offload moves the weights that a captured graph reads"
-    if refusal is None and getattr(parallel_config, "pipeline_parallel_size", 1) > 1:
-        refusal = "pipeline parallelism hands intermediate tensors between stages"
-    if refusal is not None:
-        logger.warning("%s: diffusion_use_graph ignored because %s", name, refusal)
-        return None
-    return DenoiseGraphRunner(fn=fn, name=name)
+    for runner in list(_DENOISE_RUNNERS):
+        if runner.num_graphs:
+            logger.debug("%s: dropping %d device graph(s) (%s)", runner.name, runner.num_graphs, reason)
+        runner.clear()
 
 
 def warn_if_denoise_graph_unsupported(od_config: Any, pipeline: Any) -> None:
@@ -372,3 +438,15 @@ def warn_if_denoise_graph_unsupported(od_config: Any, pipeline: Any) -> None:
             "diffusion_use_graph=True is ignored: %s does not support denoise graphs; running eager.",
             type(pipeline).__name__,
         )
+
+
+__all__ = [
+    "GraphedForward",
+    "build_denoise_graph_runner",
+    "clone_static",
+    "copy_into",
+    "denoise_graph_refusal",
+    "invalidate_denoise_graphs",
+    "kwargs_signature",
+    "warn_if_denoise_graph_unsupported",
+]

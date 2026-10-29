@@ -1596,15 +1596,15 @@ class Wan22Pipeline(
         """
         if current_model is None:
             current_model = self.transformer
-        if getattr(self, "_denoise_graph_runner", None) is not None:
-            # CFG replays the same graph for both branches; the next replay would overwrite this output.
-            return self._denoise_graph_runner(current_model=current_model, **kwargs).clone()
+        runner = getattr(self, "_denoise_graph_runner", None)
+        if runner is not None:
+            # One graph per expert and shape; replays return clones, so CFG branches cannot overwrite each other.
+            return runner(expert=int(current_model is not self.transformer), **kwargs)[0]
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
 
-    @staticmethod
-    def _denoise_graph_forward(current_model: nn.Module, **kwargs: Any) -> torch.Tensor:
-        return current_model(**kwargs)[0]
+    def _denoise_graph_forward(self, expert: int, **kwargs: Any) -> tuple[torch.Tensor, ...]:
+        return (self.transformer_2 if expert else self.transformer)(**kwargs)
 
     def encode_prompt(
         self,

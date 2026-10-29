@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.graph import DenoiseGraphRunner
+from vllm_omni.diffusion.graph import GraphedForward
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -28,20 +28,18 @@ def test_replay_matches_eager_across_eviction_and_invalidation():
     def fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return model(x) * t
 
-    runner = DenoiseGraphRunner(fn=fn, name="device", max_graphs=2)
+    runner = GraphedForward(fn, device=device, name="device", max_entries=2, warmup_iters=1)
     # Three shapes through a two-graph LRU, then back to the first: every later
     # capture happens after an earlier graph was freed. XPU needs a private pool
     # per graph for that (a shared pool asserts in the caching allocator).
     for rows in (64, 96, 128, 64, 64):
         x = torch.randn(rows, 256, device=device, dtype=torch.bfloat16)
         t = torch.rand(1, device=device, dtype=torch.bfloat16)
-        torch.testing.assert_close(runner(x=x, t=t).clone(), fn(x, t), rtol=0, atol=0)
-    runner.invalidate("test")
+        torch.testing.assert_close(runner(x=x, t=t), fn(x, t), rtol=0, atol=0)
+    runner.clear()
     x = torch.randn(64, 256, device=device, dtype=torch.bfloat16)
     t = torch.rand(1, device=device, dtype=torch.bfloat16)
-    torch.testing.assert_close(runner(x=x, t=t).clone(), fn(x, t), rtol=0, atol=0)
+    torch.testing.assert_close(runner(x=x, t=t), fn(x, t), rtol=0, atol=0)
 
     assert runner.enabled
-    assert runner.stats_snapshot()["captures"] == 5
-    assert runner.stats_snapshot()["hits"] == 1
-    assert runner.stats_snapshot()["eager"] == 0
+    assert runner.stats() == {"graphs": 1, "pinned": 0, "captures": 5, "replays": 6, "evictions": 2, "eager_calls": 0}

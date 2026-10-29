@@ -244,9 +244,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
     def _denoise_graph_forward(
         self, latents: list[torch.Tensor], timestep: torch.Tensor, prompt_embeds: list[torch.Tensor]
-    ) -> torch.Tensor:
-        # The runner replays into a single output tensor, so the per-sample list is stacked.
-        return torch.stack(self.transformer(latents, timestep, prompt_embeds)[0])
+    ) -> list[torch.Tensor]:
+        return self.transformer(latents, timestep, prompt_embeds)[0]
 
     def encode_prompt(
         self,
@@ -669,17 +668,11 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 # check Ming-Image
                 torch.compiler.cudagraph_mark_step_begin()
             runner = getattr(self, "_denoise_graph_runner", None)
-            if (
-                runner is not None
-                and not getattr(self, "_uses_cudagraph_trees", False)
-                and len({x.shape for x in latent_model_input_list}) == 1
-            ):
-                model_out_list = list(
-                    runner(
-                        latents=latent_model_input_list,
-                        timestep=timestep_model_input,
-                        prompt_embeds=prompt_embeds_model_input,
-                    ).unbind(0)
+            if runner is not None and not getattr(self, "_uses_cudagraph_trees", False):
+                model_out_list = runner(
+                    latents=latent_model_input_list,
+                    timestep=timestep_model_input,
+                    prompt_embeds=prompt_embeds_model_input,
                 )
             else:
                 model_out_list = self.transformer(
